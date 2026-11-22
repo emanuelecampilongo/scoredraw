@@ -12,7 +12,7 @@ ScoreDraw is open source and written in Rust. It renders PDF pages on demand and
 
 ScoreDraw is planned as a free download from the Microsoft Store. The interface is available in English and Italian. It follows the Windows display language by default, and you can change it under **Tools → Settings → Language**.
 
-The [contributor guide](CONTRIBUTING.md#compilare-su-windows) includes instructions for building from source on Windows.
+The [contributor guide](CONTRIBUTING.md#build-on-windows) includes instructions for building from source on Windows.
 
 ## Quick start
 
@@ -20,7 +20,7 @@ The [contributor guide](CONTRIBUTING.md#compilare-su-windows) includes instructi
 
 Choose **File → Open PDF**. Swipe sideways with one finger on the touchscreen or two fingers on a trackpad, or use the **←** and **→** keys to turn pages. Spread two fingers on the touchscreen to zoom in and pinch to zoom out. Portrait orientation lets you keep a full page in view on a Surface or other Windows tablet.
 
-<img src="assets/guida/lettura.jpg" width="570" alt="ScoreDraw in portrait orientation displaying PDF page 17 of The Barber of Seville, with the reading toolbar visible">
+<img src="assets/guida/lettura.jpg" width="570" alt="ScoreDraw in portrait orientation displaying PDF page 17 of The Barber of Seville">
 
 ### Annotate a score
 
@@ -42,31 +42,30 @@ Turn past the last page of a score to continue with the next one in the setlist.
 
 Choose **File → Make changes permanent** to embed your annotations and bookmarks in the PDF. You can create a copy or update the original. In concert mode, choose the current PDF or the entire setlist. Once embedded, the changes travel with the PDF and are visible in other PDF readers.
 
-<details>
-<summary>More controls and keyboard shortcuts</summary>
+## Controls and keyboard shortcuts
 
-#### Reading toolbar and page navigation
+### Reading toolbar and page navigation
 
 The bottom toolbar hides to give the score more room. Move the mouse, bring the pen close to the screen or touch the display to reveal it. It contains undo and redo, page navigation, zoom and the full-screen controls. Tap the page number or press **Ctrl+G** to jump to a page. When several scores are open, the page picker also lets you choose another score.
 
 ![Bottom toolbar with undo, redo, page controls, zoom and the full-screen button](assets/guida/toolbar.jpg)
 
-#### Zoom and pan
+### Zoom and pan
 
 Use **+ / −**, **Ctrl+mouse wheel** or the slider that opens when you tap the zoom percentage. **Ctrl+0** fits the page to the window. When zoomed in, pan by dragging with one finger, scrolling vertically on the trackpad or dragging with the middle mouse button.
 
-#### Favorite tools and shapes
+### Favorite tools and shapes
 
 - **Favorites.** Save a pen or highlighter style to one of its three slots in the tool options. Tap the corresponding star in the radial menu to recall the saved style.
 - **Shapes.** **Staff** inserts a blank staff and **More → Rectangle** adds a rectangle. Use **Select** and tap a shape to move it or resize it with the handles. Use the trash button or **Delete** to remove it.
 
-#### Bookmarks
+### Bookmarks
 
 Press **Ctrl+B** or choose **View → Bookmarks** to open the outline. Select a bookmark to jump to its page. Use the row controls to edit or remove it. Drag a bookmark above or below another entry to reorder it, or onto the middle of another entry to nest it.
 
 ![Bookmarks panel with nested entries and controls for editing and reordering](assets/guida/bookmarks.jpg)
 
-#### Metronome and tuner
+### Metronome and tuner
 
 Open either tool from the radial menu, or press **Ctrl+M** for the metronome and **Ctrl+T** for the tuner. Drag a panel by its header to reposition it while keeping the score in view.
 
@@ -78,11 +77,9 @@ Open either tool from the radial menu, or press **Ctrl+M** for the metronome and
 
   ![Floating chromatic tuner with a pitch gauge and the Start microphone button](assets/guida/tuner.jpg)
 
-#### Settings
+### Settings
 
 Open **Tools → Settings** to enable page turns by tapping the screen edges, change the interface language or open Windows Settings to choose the default PDF app.
-
-</details>
 
 ## Local data
 
@@ -90,9 +87,9 @@ ScoreDraw stores setlists, settings, annotations and bookmark edits on your devi
 
 ## Feedback and contributions
 
-For a bug report or feature suggestion, email [info@emanuelecampilongo.com](mailto:info@emanuelecampilongo.com). To copy the address from the app, open **? → Feedback**. For a bug, include your ScoreDraw version and the steps to reproduce it.
+Send bug reports, feature suggestions, and proposed code changes by email to [info@emanuelecampilongo.com](mailto:info@emanuelecampilongo.com). To copy the address from the app, open **? → Feedback**. For a bug, include your ScoreDraw version and the steps to reproduce it.
 
-To contribute code, see [Contributing to ScoreDraw](CONTRIBUTING.md).
+See [Contributing to ScoreDraw](CONTRIBUTING.md) for what to include in your email and how to build and test changes.
 
 ## License and credits
 

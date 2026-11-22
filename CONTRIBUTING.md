@@ -1,36 +1,16 @@
-# Contribuire a ScoreDraw
+# Contributing to ScoreDraw
 
-Puoi contribuire segnalando un problema, raccontando come usi ScoreDraw durante lo studio o un concerto, oppure proponendo una modifica al codice.
+Email [info@emanuelecampilongo.com](mailto:info@emanuelecampilongo.com) to report a bug, suggest a feature, or propose a code change. Email is the only channel for receiving and discussing changes.
 
-## Segnalare un problema
+For a bug report, include your ScoreDraw version from **? → About**, your Windows version, and the steps to reproduce the issue. Explain what you expected and what happened. When relevant, mention your device, screen orientation, zoom level, and whether you used a pen, touchscreen, trackpad, or mouse. If the issue depends on a specific score, attach a sample PDF you have permission to share.
 
-Scrivi a [info@emanuelecampilongo.com](mailto:info@emanuelecampilongo.com). Includi questi dettagli per aiutarci a riprodurre il problema.
+For a proposed change, describe the problem or use case and the behavior you would like. If you already have a patch, you can attach it to your email. For changes to the interface, include a screenshot or describe how you tested the interaction.
 
-- la versione di ScoreDraw da **? → Informazioni** e la versione di Windows
-- i passaggi da seguire, quello che ti aspettavi e quello che è successo
-- se sono rilevanti, il dispositivo, l’orientamento dello schermo, il livello di zoom e il tipo di input usato.
+## Build on Windows
 
-Quando il problema dipende da uno spartito, allega un PDF di esempio che puoi condividere, possibilmente con dati di prova.
+These instructions target Windows x64. Install stable Rust through [rustup](https://rust-lang.org/tools/install/) and the **Desktop development with C++** workload in Visual Studio, including MSVC and the Windows SDK.
 
-## Proporre una modifica
-
-Per una correzione circoscritta va bene aprire direttamente una pull request. Per una funzionalità nuova o un cambiamento ampio, scrivi prima via email per concordare il comportamento.
-
-Compila ScoreDraw seguendo le [istruzioni per Windows](#compilare-su-windows), poi esegui i controlli locali.
-
-```powershell
-cargo fmt --all -- --check
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked
-```
-
-Nella pull request descrivi il problema, la soluzione e come l’hai verificata. Per modifiche all’interfaccia, aggiungi uno screenshot o spiega come hai provato il flusso con mouse, penna o touch.
-
-## Compilare su Windows
-
-Le istruzioni qui sotto usano Windows x64. Installa Rust stabile con [rustup](https://rust-lang.org/tools/install/) e il carico di lavoro **Sviluppo di applicazioni desktop con C++** di Visual Studio, con MSVC e il Windows SDK.
-
-Apri PowerShell nella cartella dei sorgenti e lancia questi comandi.
+Open PowerShell in the source directory and run the following commands.
 
 ```powershell
 cargo build --release --locked
@@ -38,24 +18,32 @@ cargo build --release --locked
 .\target\release\scoredraw.exe
 ```
 
-`setup-pdfium.ps1` scarica la versione prevista di PDFium, verifica il checksum e copia la DLL e le relative licenze in `target\release`. Per un’altra cartella di output usa `-OutputDirectory`. Se hai già una toolchain isolata sotto `.toolchain`, puoi attivarla con `. .\dev.ps1`.
+`setup-pdfium.ps1` downloads the pinned PDFium release, verifies its checksum, and copies the DLL and its license notices to `target\release`. Use `-OutputDirectory` to choose another build directory. If you already have an isolated toolchain under `.toolchain`, activate it with `. .\dev.ps1`.
 
-### Misurare il rendering
-
-Per misurare apertura, anteprima e rasterizzazione delle prime pagine, indica una o più partiture e il percorso del report TSV.
+Run the local checks before sending a patch.
 
 ```powershell
-.\target\release\scoredraw.exe --misura "misure.tsv" "C:\Spartiti\Esempio.pdf"
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
 ```
 
-### Preparare un pacchetto MSIX
+### Measure PDF rendering
 
-Per generare un pacchetto MSIX di sviluppo usa MakeAppx del Windows SDK.
+To measure document opening, preview generation, and rendering of the first pages, pass a report path followed by one or more PDFs.
+
+```powershell
+.\target\release\scoredraw.exe --misura "measurements.tsv" "C:\Scores\Example.pdf"
+```
+
+### Build an MSIX package
+
+To create a development package, use MakeAppx from the Windows SDK. Run the PDFium setup script for the same build directory before packaging.
 
 ```powershell
 .\package-msix.ps1 -BuildDirectory 'target\release'
 ```
 
-Per compilare il pacchetto destinato allo Store, passa `-IdentityName`, `-Publisher` e `-PublisherDisplayName` con i valori assegnati in Partner Center.
+For a Microsoft Store package, pass `-IdentityName`, `-Publisher`, and `-PublisherDisplayName` using the values from Partner Center.
 
-Quando distribuisci un binario di ScoreDraw, rendi disponibile il sorgente corrispondente a quella versione secondo i termini della GPLv3.
+If you distribute a ScoreDraw binary, make the corresponding source code available under the terms of the GPLv3.

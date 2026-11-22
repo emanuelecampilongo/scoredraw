@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">ScoreDraw</title>
+  <desc id="desc">Icona verde piena con cinque linee scure del pentagramma e un tratto a mano libera.</desc>
+  <path d="M 83 37 C 58 41 43 57 38 86 L 25 179 C 21 208 35 226 64 227 L 171 227 C 198 227 214 210 217 182 L 233 74 C 238 43 222 23 194 23 Z" fill="#BACD90"/>
+    <g fill="none" stroke="#1B1E18" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M65 86 H190 M65 106 H190 M65 126 H190 M65 146 H190 M65 166 H190" stroke-width="5.5"/>
+      <path d="M72 159 C85 136 105 105 119 101 C136 96 116 139 121 145 C127 153 144 125 154 125 C164 124 157 144 168 140 C176 137 181 133 185 132" stroke-width="11"/>
+    </g>
+</svg>

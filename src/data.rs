@@ -1,4 +1,5 @@
 use crate::ink::Tool;
+use crate::overlay::SWATCHES;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
@@ -51,6 +52,8 @@ pub struct Settings {
     pub active_preset: Option<u8>,
     pub(crate) pen_presets: [Option<Style>; 3],
     pub(crate) highlighter_presets: [Option<Style>; 3],
+    #[serde(default)]
+    pub(crate) updated_tool_defaults: bool,
     #[serde(skip_serializing)]
     pub(crate) favorites: [Option<Favorite>; 4],
 }
@@ -77,11 +80,12 @@ impl Settings {
         let settings = Settings::default();
         saved.unwrap_or_else(|| match tool {
             PresetTool::Pen => Style {
-                color: [0x8a481b, 0x4e2a92, 0x425c1e][index],
+                color: [SWATCHES[2], SWATCHES[3], 0x425c1e][index],
+                width: [0.003, 0.010, settings.pen.width][index],
                 ..settings.pen
             },
             PresetTool::Highlighter => Style {
-                color: [0x48d7ff, 0x96e17c, 0xf6b0d9][index],
+                color: [SWATCHES[8], SWATCHES[7], SWATCHES[4]][index],
                 ..settings.highlighter
             },
         })
@@ -101,6 +105,47 @@ impl Settings {
         Some((self.active_tool.preset_group()?, slot))
     }
 
+    fn migrate_tool_defaults(&mut self) {
+        if self.updated_tool_defaults {
+            return;
+        }
+        let defaults = Self::default();
+        for (style, previous, current) in [
+            (
+                &mut self.pen,
+                Style {
+                    color: 0xb04820,
+                    opacity: 255,
+                    width: 0.0035,
+                },
+                defaults.pen,
+            ),
+            (
+                &mut self.highlighter,
+                Style {
+                    color: 0x32eaff,
+                    opacity: 100,
+                    width: 0.024,
+                },
+                defaults.highlighter,
+            ),
+            (
+                &mut self.rectangle,
+                Style {
+                    color: 0xffffff,
+                    opacity: 255,
+                    width: 0.0,
+                },
+                defaults.rectangle,
+            ),
+        ] {
+            if *style == previous {
+                *style = current;
+            }
+        }
+        self.updated_tool_defaults = true;
+    }
+
     fn migrate_presets(&mut self) {
         for (index, favorite) in std::mem::take(&mut self.favorites).into_iter().enumerate() {
             let Some(favorite) = favorite else { continue };
@@ -118,7 +163,7 @@ impl Settings {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Style {
     pub color: u32,
     pub opacity: u8,
@@ -134,18 +179,18 @@ impl Default for Settings {
             bpm: 96,
             beats: 4,
             pen: Style {
-                color: 0xb04820,
+                color: SWATCHES[0],
                 opacity: 255,
-                width: 0.0035,
+                width: 0.003,
             },
             highlighter: Style {
-                color: 0x32eaff,
-                opacity: 100,
-                width: 0.024,
+                color: SWATCHES[8],
+                opacity: 128,
+                width: 0.030,
             },
             rectangle: Style {
-                color: 0xffffff,
-                opacity: 255,
+                color: SWATCHES[2],
+                opacity: 204,
                 width: 0.0,
             },
             staff: Style {
@@ -157,6 +202,7 @@ impl Default for Settings {
             active_preset: None,
             pen_presets: [None; 3],
             highlighter_presets: [None; 3],
+            updated_tool_defaults: true,
             favorites: [None; 4],
         }
     }
@@ -186,6 +232,7 @@ impl Store {
     pub fn settings(&self) -> io::Result<Settings> {
         let mut settings: Settings = read_or_default(&self.root.join("settings.json"))?;
         settings.migrate_presets();
+        settings.migrate_tool_defaults();
         Ok(settings)
     }
 

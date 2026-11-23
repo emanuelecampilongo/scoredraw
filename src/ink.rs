@@ -838,6 +838,7 @@ fn draw_mark(canvas: &Canvas, area: RECT, mark: &Mark, clip: RECT) {
                 &samples,
                 canvas::argb(COLORREF(style.color), style.opacity),
                 clip,
+                *variable,
             );
         }
         Mark::Shape {
@@ -906,7 +907,7 @@ fn stroke_samples(points: &[Point], area: RECT, width: f32, variable: bool) -> V
                 let before = points[i.saturating_sub(1)].pressure;
                 let after = points[(i + 1).min(points.len() - 1)].pressure;
                 let pressure = ((before + 2.0 * p.pressure + after) / 4.0).clamp(0.0, 1.0);
-                0.27 + 1.38 * pressure.sqrt()
+                0.18 + 1.72 * pressure
             } else {
                 1.0
             };
@@ -963,18 +964,76 @@ fn stroke_quads(samples: &[StrokeSample]) -> impl Iterator<Item = [PointF; 4]> +
     })
 }
 
-fn draw_stroke_clipped(canvas: &Canvas, samples: &[StrokeSample], color: u32, clip: RECT) {
+fn highlighter_polygons(samples: &[StrokeSample]) -> impl Iterator<Item = [PointF; 8]> + '_ {
+    samples
+        .iter()
+        .enumerate()
+        .map(|(index, &end)| {
+            let start = samples[index.saturating_sub(1)];
+            let nib = |sample: StrokeSample| {
+                let r = sample.radius;
+                let c = r * 0.65;
+                [
+                    (-c, -r),
+                    (c, -r),
+                    (r, -c),
+                    (r, c),
+                    (c, r),
+                    (-c, r),
+                    (-r, c),
+                    (-r, -c),
+                ]
+                .map(|(x, y)| PointF {
+                    X: sample.x + x,
+                    Y: sample.y + y,
+                })
+            };
+            (nib(start), nib(end))
+        })
+        .flat_map(|(start, end)| {
+            // Sweep the beveled nib along the segment, keeping all figures wound alike.
+            let dx = end[0].X - start[0].X;
+            let dy = end[0].Y - start[0].Y;
+            std::iter::once(end).chain((0..8).filter_map(move |i| {
+                let next = (i + 1) % 8;
+                let edge_x = start[next].X - start[i].X;
+                let edge_y = start[next].Y - start[i].Y;
+                (edge_x * dy - edge_y * dx > 0.0).then_some([
+                    start[i],
+                    start[next],
+                    end[next],
+                    end[i],
+                    end[i],
+                    end[i],
+                    end[i],
+                    end[i],
+                ])
+            }))
+        })
+}
+
+fn draw_stroke_clipped(
+    canvas: &Canvas,
+    samples: &[StrokeSample],
+    color: u32,
+    clip: RECT,
+    variable: bool,
+) {
     if samples.is_empty() || color >> 24 == 0 {
         return;
     }
     let Some(path) = Path::new() else { return };
+    if !variable {
+        for polygon in highlighter_polygons(samples) {
+            if polygon_overlaps(&polygon, clip) {
+                path.polygon(&polygon);
+            }
+        }
+        canvas.fill_path(&path, color);
+        return;
+    }
     for quad in stroke_quads(samples) {
-        let overlap = |outside: &dyn Fn(&PointF) -> bool| !quad.iter().all(outside);
-        if overlap(&|p| p.X < clip.left as f32)
-            && overlap(&|p| p.X > clip.right as f32)
-            && overlap(&|p| p.Y < clip.top as f32)
-            && overlap(&|p| p.Y > clip.bottom as f32)
-        {
+        if polygon_overlaps(&quad, clip) {
             path.polygon(&quad);
         }
     }
@@ -989,6 +1048,13 @@ fn draw_stroke_clipped(canvas: &Canvas, samples: &[StrokeSample], color: u32, cl
     }
     // Fill all segments together so a translucent stroke has uniform opacity at its joins.
     canvas.fill_path(&path, color);
+}
+
+fn polygon_overlaps(points: &[PointF], clip: RECT) -> bool {
+    points.iter().any(|p| p.X >= clip.left as f32)
+        && points.iter().any(|p| p.X <= clip.right as f32)
+        && points.iter().any(|p| p.Y >= clip.top as f32)
+        && points.iter().any(|p| p.Y <= clip.bottom as f32)
 }
 
 impl Mark {
@@ -1015,6 +1081,17 @@ impl Mark {
             } => {
                 let scale = (area.right - area.left).min(area.bottom - area.top) as f32;
                 let samples = stroke_samples(points, area, style.width * scale, *variable);
+                if !variable {
+                    for polygon in highlighter_polygons(&samples) {
+                        let [first, rest @ ..] = polygon;
+                        writeln!(out, "{:.3} {:.3} m", first.X, first.Y)?;
+                        for point in rest {
+                            writeln!(out, "{:.3} {:.3} l", point.X, point.Y)?;
+                        }
+                        writeln!(out, "h")?;
+                    }
+                    return writeln!(out, "f");
+                }
                 for [a, b, c, d] in stroke_quads(&samples) {
                     writeln!(
                         out,
@@ -1510,38 +1587,29 @@ mod tests {
                 right: width,
                 bottom: height,
             };
-            FillRect(dc, &rect, HBRUSH(GetStockObject(WHITE_BRUSH).0));
-            {
-                let canvas = Canvas::new(dc).unwrap();
-                let stroke = [10.0, 24.0, 40.0, 60.0].map(|x| StrokeSample {
-                    x,
-                    y: 20.0,
-                    radius: 6.0,
-                });
-                draw_stroke_clipped(
-                    &canvas,
-                    &stroke,
-                    0x80ffb400,
-                    RECT {
-                        left: 0,
-                        top: 0,
-                        right: width,
-                        bottom: height,
-                    },
-                );
+            for variable in [true, false] {
+                FillRect(dc, &rect, HBRUSH(GetStockObject(WHITE_BRUSH).0));
+                {
+                    let canvas = Canvas::new(dc).unwrap();
+                    let stroke = [10.0, 24.0, 40.0, 60.0].map(|x| StrokeSample {
+                        x,
+                        y: 20.0,
+                        radius: 6.0,
+                    });
+                    draw_stroke_clipped(&canvas, &stroke, 0x80ffb400, rect, variable);
+                }
+                let _ = GdiFlush();
+                let sample = |x, y| *bits.cast::<u32>().add((y * width + x) as usize) & 0x00ff_ffff;
+                let center = sample(17, 20);
+                assert_eq!(sample(24, 20), center);
+                assert_eq!(sample(17, 4), 0xffffff);
+                assert!((110..=145).contains(&(center & 255)));
+                // Near the first endpoint the beveled nib reaches farther than a round tip.
+                assert_eq!(sample(5, 16) != 0xffffff, !variable);
             }
-            let _ = GdiFlush();
-            let sample = |x, y| *bits.cast::<u32>().add((y * width + x) as usize) & 0x00ff_ffff;
-            let (center, join, outside) = (sample(17, 20), sample(24, 20), sample(17, 4));
             SelectObject(dc, original);
             let _ = DeleteObject(dib.into());
             let _ = DeleteDC(dc);
-            assert_eq!(outside, 0xffffff);
-            assert_eq!(join, center);
-            assert!(
-                (110..=145).contains(&(center & 255)),
-                "colore del tratto: {center:06x}"
-            );
         }
     }
 }

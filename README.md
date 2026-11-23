@@ -10,7 +10,9 @@ ScoreDraw is open source and written in Rust. It renders PDF pages on demand and
 
 ## Availability
 
-ScoreDraw is planned as a free download from the Microsoft Store. The interface is available in English and Italian. It follows the Windows display language by default, and you can change it under **Tools → Settings → Language**.
+**[Get ScoreDraw on the Microsoft Store](https://apps.microsoft.com/detail/9N5Q5Q5N916X)**
+
+The interface is available in English and Italian. It follows the Windows display language by default, and you can change it under **Tools → Settings → Language**.
 
 The [contributor guide](CONTRIBUTING.md#build-on-windows) includes instructions for building from source on Windows.
 

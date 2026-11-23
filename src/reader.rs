@@ -69,6 +69,8 @@ const SHOW_ABOUT: u32 = WM_APP + 12;
 const SHOW_EXPORT_REPORT: u32 = WM_APP + 13;
 const DEFAULT_PDF: u32 = WM_APP + 14;
 const SHOW_FEEDBACK: u32 = WM_APP + 15;
+const CHECK_STORE_UPDATE: u32 = WM_APP + 16;
+const STORE_UPDATE_AVAILABLE: u32 = WM_APP + 17;
 const PAGE_ERASE_TIMER: usize = 6;
 const BOOKMARK_DRAG_TIMER: usize = 7;
 const PRESET_SAVED_TIMER: usize = 8;
@@ -77,12 +79,14 @@ const VIEW_SETTLE_MS: u32 = 130;
 const INK_SAVE_MS: u32 = 180;
 const PAGE_FADE_TIME: Duration = Duration::from_millis(200);
 const ZOOM_TIME: Duration = Duration::from_millis(170);
+const WELCOME_LOGO: &[u8] = include_bytes!("../assets/scoredraw.png");
 
 mod animation;
 mod association;
 mod tools;
 use animation::{ANIMATION_FRAME, Animation};
 mod chrome;
+mod store_update;
 mod trackpad;
 
 pub fn show_startup_error(error: &Error) {
@@ -107,6 +111,7 @@ fn run_window(files: Vec<PathBuf>) -> Result<()> {
     let settings = store.settings().unwrap_or_default();
     crate::language::apply(settings.language);
     let state = RefCell::new(Reader {
+        welcome_logo: canvas::Bitmap::from_png(WELCOME_LOGO),
         store: Some(store.clone()),
         tool: settings.active_tool,
         favorite: settings.selected_preset(),
@@ -125,7 +130,6 @@ fn run_window(files: Vec<PathBuf>) -> Result<()> {
             LR_SHARED,
         )
         .map_or(HICON::default(), |handle| HICON(handle.0));
-        state.borrow_mut().app_icon = icon;
         let class_name = w!("ScoreDraw.Reader");
         let class = WNDCLASSW {
             hCursor: LoadCursorW(None, IDC_ARROW)?,
@@ -179,7 +183,9 @@ fn run_window(files: Vec<PathBuf>) -> Result<()> {
             let _ = ShowWindow(hwnd, SW_MAXIMIZE);
         }
         state.borrow_mut().open(hwnd, files, false);
+        post(hwnd, CHECK_STORE_UPDATE);
         post(hwnd, DEFAULT_PDF);
+        let mut _store_check = None;
         let mut message = MSG::default();
         loop {
             match GetMessageW(&mut message, None, 0, 0).0 {
@@ -249,6 +255,9 @@ fn run_window(files: Vec<PathBuf>) -> Result<()> {
                 _ if message.hwnd == hwnd && message.message == DEFAULT_PDF => {
                     association::prompt(hwnd, &state, message.wParam.0 != 0);
                 }
+                _ if message.hwnd == hwnd && message.message == CHECK_STORE_UPDATE => {
+                    _store_check = store_update::Check::start(hwnd).ok();
+                }
                 _ => {
                     let _ = TranslateMessage(&message);
                     DispatchMessageW(&message);
@@ -289,7 +298,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
 
 #[derive(Default)]
 struct Reader {
-    app_icon: HICON,
+    welcome_logo: Option<canvas::Bitmap>,
     session: u64,
     requests: Option<mpsc::Sender<Request>>,
     responses: Option<mpsc::Receiver<Response>>,
@@ -297,6 +306,7 @@ struct Reader {
     total: u32,
     selected: u32,
     concert: bool,
+    store_update_available: bool,
     desired: Option<PageKey>,
     visible: Option<(PageKey, Arc<Frame>)>,
     cache: HashMap<PageKey, Arc<Frame>>,
@@ -438,6 +448,12 @@ impl Reader {
                 minimum.ptMinTrackSize = POINT { x: 410, y: 430 };
             },
             render_queue::RENDER_RESULT => self.receive(hwnd),
+            STORE_UPDATE_AVAILABLE => {
+                self.store_update_available = true;
+                if !self.performing() {
+                    repaint(hwnd);
+                }
+            }
             PDF_EDIT_RESULT => self.pdf_edit_result(hwnd),
             SAVE_RESULT => {
                 if self.close_after_save && !matches!(self.save_status(), SaveStatus::Saving) {
@@ -1533,6 +1549,10 @@ impl Reader {
         }
     }
 
+    fn performing(&self) -> bool {
+        self.concert && self.fullscreen.is_some()
+    }
+
     fn toggle_fullscreen(&mut self, hwnd: HWND) {
         self.chrome_menu = None;
         self.chrome_hover = None;
@@ -1733,21 +1753,22 @@ impl Reader {
                 right: library.right,
                 ..open
             };
-            let icon = layout.px(76);
-            let left = (layout.client.right + layout.client.left - icon) / 2;
-            let _ = unsafe {
-                DrawIconEx(
-                    dc,
-                    left,
-                    bounds.top - layout.px(179),
-                    self.app_icon,
-                    icon,
-                    icon,
-                    0,
-                    None,
-                    DI_NORMAL,
-                )
+            let size = layout.px(76);
+            let left = (layout.client.right + layout.client.left - size) / 2;
+            let top = bounds.top - layout.px(179);
+            let logo_bounds = RECT {
+                left,
+                top,
+                right: left + size,
+                bottom: top + size,
             };
+            if let Some(logo) = &self.welcome_logo
+                && let Some(clip) = intersect(logo_bounds, damage)
+                && let Some(canvas) = Canvas::new(dc)
+            {
+                canvas.clip(clip);
+                canvas.image(logo, logo_bounds);
+            }
             let title = RECT {
                 bottom: bounds.top - layout.px(25),
                 top: bounds.top - layout.px(94),
@@ -2783,6 +2804,44 @@ mod tests {
         };
         text(dc, bounds, "", TEXT, 16);
         assert!(unsafe { DeleteDC(dc) }.as_bool());
+    }
+
+    #[test]
+    fn welcome_logo_keeps_smooth_edges_at_display_scales() {
+        let _drawing = canvas::Startup::new().unwrap();
+        let reader = Reader {
+            welcome_logo: Some(canvas::Bitmap::from_png(WELCOME_LOGO).unwrap()),
+            ..Reader::default()
+        };
+        let screen = unsafe { GetDC(None) };
+        assert!(!screen.is_invalid());
+        for scale in [1.0, 1.5, 2.0, 3.0] {
+            let client = RECT {
+                right: (420.0 * scale) as i32,
+                bottom: (485.0 * scale) as i32,
+                ..RECT::default()
+            };
+            let layout = Layout {
+                client,
+                viewport: client,
+                strip: None,
+                scale,
+                dpi: scale,
+            };
+            let surface = Surface::new(screen, client.right, client.bottom).unwrap();
+            reader.draw(HWND::default(), surface.dc, &layout, client);
+
+            let center = client.right / 2;
+            let top = layout.welcome_actions().0.top - layout.px(179);
+            let pixel = |y| unsafe { GetPixel(surface.dc, center, top + y) };
+            assert_eq!(pixel(0), BACKGROUND);
+            assert_eq!(pixel(layout.px(19)), ACCENT);
+            assert!((1..layout.px(19)).any(|y| {
+                let color = pixel(y);
+                color != BACKGROUND && color != ACCENT
+            }));
+        }
+        assert_ne!(unsafe { ReleaseDC(None, screen) }, 0);
     }
 
     #[test]

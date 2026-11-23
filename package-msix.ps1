@@ -4,7 +4,8 @@ param(
     [string]$IdentityName = 'ScoreDraw.Development',
     [string]$Publisher = 'CN=ScoreDraw Development',
     [string]$PublisherDisplayName = 'ScoreDraw',
-    [version]$Version = '0.4.11.0'
+    [version]$Version = '0.4.12.0',
+    [string]$OutputDirectory = (Join-Path $PSScriptRoot 'target\msix')
 )
 
 $ErrorActionPreference = 'Stop'
@@ -44,7 +45,7 @@ $architecture = switch ([BitConverter]::ToUInt16($exe, $peHeader + 4)) {
     default { throw 'Architettura del file eseguibile non riconosciuta.' }
 }
 
-$output = Join-Path $PSScriptRoot 'target\msix'
+$output = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputDirectory)
 $stage = Join-Path $output ([Guid]::NewGuid().ToString('N'))
 $assets = Join-Path $stage 'Assets'
 New-Item -ItemType Directory -Path $assets -Force | Out-Null

@@ -1,14 +1,14 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
   <title id="title">Documento PDF | ScoreDraw</title>
-  <desc id="desc">Foglio bianco con angolo ripiegato e icona ScoreDraw sovrapposta in basso a destra.</desc>
-  <path d="M32 18 H143 L201 76 V231 Q201 238 194 238 H32 Q25 238 25 231 V25 Q25 18 32 18 Z" fill="#FFFFFF" stroke="#9B9B9B" stroke-width="4" stroke-linejoin="round"/>
-  <path d="M143 18 V76 H201" fill="none" stroke="#9B9B9B" stroke-width="4" stroke-linejoin="round"/>
-  <g transform="translate(42 68) scale(.79)">
+  <desc id="desc">Foglio bianco con contorno scuro, angolo ripiegato grigio e logo verde di ScoreDraw.</desc>
+  <path d="M63 14 H155 L204 63 V223 Q204 236 191 236 H62 Q49 236 49 223 V27 Q49 14 63 14 Z" fill="#F8FAFD" stroke="#53515A" stroke-width="6" stroke-linejoin="round"/>
+  <path d="M155 14 V52 Q155 63 166 63 H204 Z" fill="#D8DFEA" stroke="#53515A" stroke-width="4" stroke-linejoin="round"/>
+  <g transform="translate(53 66) scale(.58)">
     <path d="M 83 37 C 58 41 43 57 38 86 L 25 179 C 21 208 35 226 64 227 L 171 227 C 198 227 214 210 217 182 L 233 74 C 238 43 222 23 194 23 Z" fill="#BACD90"/>
     <g fill="none" stroke="#1B1E18" stroke-linecap="round" stroke-linejoin="round">
-      <path d="M65 86 H190 M65 106 H190 M65 126 H190 M65 146 H190 M65 166 H190" stroke-width="5.5"/>
-      <path d="M72 159 C85 136 105 105 119 101 C136 96 116 139 121 145 C127 153 144 125 154 125 C164 124 157 144 168 140 C176 137 181 133 185 132" stroke-width="11"/>
+      <path d="M65 86 H190 M65 106 H190 M65 126 H190 M65 146 H190 M65 166 H190" stroke-width="7"/>
+      <path d="M72 159 C85 136 105 105 119 101 C136 96 116 139 121 145 C127 153 144 125 154 125 C164 124 157 144 168 140 C176 137 181 133 185 132" stroke-width="13"/>
     </g>
   </g>
 </svg>

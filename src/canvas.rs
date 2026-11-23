@@ -2,6 +2,8 @@ use std::ptr::null_mut;
 use windows::Win32::Foundation::{COLORREF, E_FAIL, RECT};
 use windows::Win32::Graphics::Gdi::HDC;
 use windows::Win32::Graphics::GdiPlus::{self as gdi, *};
+use windows::Win32::System::Com::IStream;
+use windows::Win32::UI::Shell::SHCreateMemStream;
 
 pub struct Startup(usize);
 
@@ -55,6 +57,21 @@ impl Canvas {
                 rect.right - rect.left,
                 rect.bottom - rect.top,
                 CombineModeIntersect,
+            );
+        }
+    }
+
+    pub fn image(&self, bitmap: &Bitmap, rect: RECT) {
+        unsafe {
+            GdipSetInterpolationMode(self.0, InterpolationModeHighQualityBicubic);
+            GdipSetPixelOffsetMode(self.0, PixelOffsetModeHalf);
+            GdipDrawImageRectI(
+                self.0,
+                bitmap.image,
+                rect.left,
+                rect.top,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
             );
         }
     }
@@ -124,6 +141,32 @@ impl Canvas {
 impl Drop for Canvas {
     fn drop(&mut self) {
         unsafe { GdipDeleteGraphics(self.0) };
+    }
+}
+
+pub struct Bitmap {
+    image: *mut GpImage,
+    _stream: IStream,
+}
+
+impl Bitmap {
+    pub fn from_png(bytes: &[u8]) -> Option<Self> {
+        let stream = unsafe { SHCreateMemStream(Some(bytes)) }?;
+        let mut bitmap = null_mut();
+        if unsafe { GdipCreateBitmapFromStream(&stream, &mut bitmap) } != gdi::Ok {
+            return None;
+        }
+        // GDI+ can keep reading the stream until the image is disposed.
+        Some(Self {
+            image: bitmap.cast(),
+            _stream: stream,
+        })
+    }
+}
+
+impl Drop for Bitmap {
+    fn drop(&mut self) {
+        unsafe { GdipDisposeImage(self.image) };
     }
 }
 

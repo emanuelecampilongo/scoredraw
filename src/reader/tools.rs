@@ -418,6 +418,12 @@ impl Reader {
                 ],
             },
         );
+        if self.store_update_available
+            && !self.performing()
+            && let Some(banner) = overlay::Card::store_update(layout.viewport, layout.scale)
+        {
+            cards.insert(0, banner);
+        }
         if let Some(card) = self.chrome_card(layout) {
             cards.push(card);
         }
@@ -518,6 +524,8 @@ impl Reader {
             Event::DefaultPdf => {
                 let _ = unsafe { PostMessageW(Some(hwnd), DEFAULT_PDF, WPARAM(1), LPARAM(0)) };
             }
+            Event::OpenStore => store_update::open_listing(hwnd),
+            Event::DismissStoreUpdate => self.store_update_available = false,
             Event::SavePreset(slot) => {
                 let Some(tool) = self.tool.preset_group() else {
                     return;
@@ -535,11 +543,11 @@ impl Reader {
             Event::CustomColor => post(hwnd, OPEN_PREFERENCES),
             Event::Licenses => post(hwnd, SHOW_ABOUT),
             Event::Feedback => post(hwnd, SHOW_FEEDBACK),
-            Event::Website => unsafe {
+            Event::Website(url) => unsafe {
                 windows::Win32::UI::Shell::ShellExecuteW(
                     Some(hwnd),
                     w!("open"),
-                    w!("https://emanuelecampilongo.com"),
+                    &HSTRING::from(url),
                     None,
                     None,
                     SW_SHOWNORMAL,

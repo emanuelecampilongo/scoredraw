@@ -48,6 +48,8 @@ pub enum Event {
     BookmarkDrag(usize),
     Finalize,
     DefaultPdf,
+    OpenStore,
+    DismissStoreUpdate,
     AudioToggle(usize),
     AudioClose(usize),
     Bpm(i16),
@@ -64,7 +66,7 @@ pub enum Event {
     DeleteShape,
     SavePreset(u8),
     CustomColor,
-    Website,
+    Website(&'static str),
     Licenses,
 }
 
@@ -399,7 +401,7 @@ impl Overlay {
                 }
             }
             Sheet::Preferences => 263,
-            Sheet::About => 286,
+            Sheet::About => 299,
         };
         let width_dp = if sheet == Sheet::Bookmarks { 386 } else { 320 };
         let scale = scale
@@ -559,6 +561,36 @@ impl Overlay {
 }
 
 impl Card {
+    pub fn store_update(viewport: RECT, scale: f32) -> Option<Self> {
+        let px = |dp: i32| (dp as f32 * scale).round() as i32;
+        let w = px(366);
+        let h = px(54);
+        if viewport.right - viewport.left < w || viewport.bottom - viewport.top < h + px(8) {
+            return None;
+        }
+        let x = viewport.left + (viewport.right - viewport.left - w) / 2;
+        let mut card = Self::new(x, viewport.top + px(8), w, h, scale, None);
+        card.label(
+            [9, 6, 181, 42],
+            tr!("È disponibile un aggiornamento", "An update is available"),
+            13,
+            false,
+        );
+        card.button(
+            [192, 6, 82, 42],
+            tr!("Aggiorna", "Update"),
+            Event::OpenStore,
+            true,
+        );
+        card.button(
+            [280, 6, 78, 42],
+            tr!("Più tardi", "Later"),
+            Event::DismissStoreUpdate,
+            false,
+        );
+        Some(card)
+    }
+
     pub fn new(x: i32, y: i32, w: i32, h: i32, scale: f32, floating: Option<usize>) -> Self {
         Self {
             rect: RECT {
@@ -993,16 +1025,27 @@ impl Card {
             false,
         );
         self.button(
-            [19, 145, 282, 46],
-            "emanuelecampilongo.com",
-            Event::Website,
+            [16, 134, 288, 44],
+            tr!("Sito di ScoreDraw", "ScoreDraw website"),
+            Event::Website("https://emanuelecampilongo.com/software/scoredraw/"),
             true,
         );
         self.button(
-            [19, 204, 282, 48],
-            tr!("Crediti e licenze", "Credits and licenses"),
-            Event::Licenses,
+            [16, 186, 288, 44],
+            tr!("Codice sorgente su GitHub", "Source code on GitHub"),
+            Event::Website("https://github.com/emanuelecampilongo/scoredraw"),
             false,
+        );
+        self.pair(
+            242,
+            (
+                tr!("Sito dell’autore", "Author’s website"),
+                Event::Website("https://emanuelecampilongo.com"),
+            ),
+            (
+                tr!("Crediti e licenze", "Credits and licenses"),
+                Event::Licenses,
+            ),
         );
     }
 

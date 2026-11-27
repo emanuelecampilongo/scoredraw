@@ -176,6 +176,11 @@ unsafe extern "system" fn themed(hwnd: HWND, msg: u32, wp: WPARAM, mut lp: LPARA
                 return brush.0 as isize;
             }
             WM_DRAWITEM if (*(lp.0 as *const DRAWITEMSTRUCT)).CtlType == ODT_BUTTON => {
+                if let Some(callback) = callback
+                    && callback(hwnd, msg, wp, lp) != 0
+                {
+                    return 1;
+                }
                 let item = &*(lp.0 as *const DRAWITEMSTRUCT);
                 let mut title = [0; 256];
                 let count = GetWindowTextW(item.hwndItem, &mut title).max(0) as usize;
@@ -330,10 +335,10 @@ impl EditField {
             id: self.id,
             class: EDIT,
             rect: [
-                (x + 6) as u16,
-                (y + (height - 14) / 2) as u16,
-                (width - 12) as u16,
-                14,
+                (x + 7) as u16,
+                (y + (height - 10) / 2) as u16,
+                (width - 14) as u16,
+                10,
             ],
             title,
             style: WS_TABSTOP.0 | ES_AUTOHSCROLL as u32 | extra,
@@ -390,19 +395,31 @@ pub fn setlist_name(
             tr!("Crea scaletta", "Create setlist"),
         )
     };
+    prompt_text(owner, caption, tr!("Nome della scaletta", "Setlist name"),
+        initial.unwrap_or_default(), action, |name| {
+            if !(1..=100).contains(&name.chars().count()) {
+                Err(tr!("Usa un nome tra 1 e 100 caratteri.", "Use a name between 1 and 100 characters long."))
+            } else if !available(name) {
+                Err(tr!("Esiste già una scaletta con questo nome.", "A setlist already has this name."))
+            } else {
+                Ok(())
+            }
+        })
+}
+
+pub fn prompt_text(
+    owner: HWND, caption: &str, label: &str, initial: &str, action: &str,
+    validate: impl Fn(&str) -> std::result::Result<(), &'static str>,
+) -> Result<Option<String>> {
     let controls = [
-        Control::label(
-            200,
-            [14, 16, 230, 14],
-            tr!("Nome della scaletta", "Setlist name"),
-        ),
-        NAME_FIELD.control(initial.unwrap_or_default(), 0),
+        Control::label(200, [14, 16, 230, 14], label),
+        NAME_FIELD.control(initial, 0),
         Control::label(201, [14, 69, 230, 14], ""),
         Control::button(2, [100, 91, 65, 23], tr!("Annulla", "Cancel")),
         Control::button(1, [170, 91, 74, 23], action),
     ];
     let prompt = NamePrompt {
-        available: &available,
+        validate: &validate,
         selected: RefCell::default(),
     };
     show(
@@ -417,7 +434,7 @@ pub fn setlist_name(
 }
 
 struct NamePrompt<'a> {
-    available: &'a dyn Fn(&str) -> bool,
+    validate: &'a dyn Fn(&str) -> std::result::Result<(), &'static str>,
     selected: RefCell<Option<String>>,
 }
 
@@ -439,29 +456,11 @@ unsafe extern "system" fn setlist_name_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp
         WM_LBUTTONDOWN if field_focus(hwnd, lp, &[NAME_FIELD]) => 1,
         WM_COMMAND if wp.0 as u16 == 1 => {
             let name = value(hwnd, 101).trim().to_owned();
-            if !(1..=100).contains(&name.chars().count()) {
-                set_value(
-                    hwnd,
-                    201,
-                    tr!(
-                        "Usa un nome tra 1 e 100 caratteri.",
-                        "Use a name between 1 and 100 characters long."
-                    ),
-                );
-                return 1;
-            }
             unsafe {
                 let prompt = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const NamePrompt<'_>;
                 if let Some(prompt) = prompt.as_ref() {
-                    if !(prompt.available)(&name) {
-                        set_value(
-                            hwnd,
-                            201,
-                            tr!(
-                                "Esiste già una scaletta con questo nome.",
-                                "A setlist already has this name."
-                            ),
-                        );
+                    if let Err(error) = (prompt.validate)(&name) {
+                        set_value(hwnd, 201, error);
                         return 1;
                     }
                     *prompt.selected.borrow_mut() = Some(name);
@@ -702,14 +701,14 @@ fn offer(
 ) -> Result<bool> {
     let message = format!("{prompt}\r\n{detail}");
     let controls = [
-        Control::label(101, [13, 12, 323, 35], &message),
+        Control::label(101, [13, 12, 271, 35], &message),
         Control::button(1, [13, 50, 158, 28], action),
         Control::button(2, [181, 50, 84, 28], cancel),
     ];
     show(
         owner,
         title,
-        [349, 90],
+        [278, 90],
         &controls,
         Some(choice_proc),
         LPARAM(0),

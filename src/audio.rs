@@ -337,14 +337,14 @@ fn detect_pitch(samples: &[f32], rate: f32) -> Option<f32> {
     None
 }
 
-fn note(hz: f32) -> (String, f32) {
+fn note(hz: f32, reference: u16) -> (String, String, f32) {
     const ITALIAN: [&str; 12] = [
         "Do", "Do♯", "Re", "Re♯", "Mi", "Fa", "Fa♯", "Sol", "Sol♯", "La", "La♯", "Si",
     ];
     const ENGLISH: [&str; 12] = [
         "C", "C♯", "D", "D♯", "E", "F", "F♯", "G", "G♯", "A", "A♯", "B",
     ];
-    let midi = 69.0 + 12.0 * (hz / 440.0).log2();
+    let midi = 69.0 + 12.0 * (hz / f32::from(reference)).log2();
     let nearest = midi.round() as i32;
     let cents = ((midi - nearest as f32) * 100.0).round() as i32;
     let names = if crate::language::english() {
@@ -363,6 +363,7 @@ fn note(hz: f32) -> (String, f32) {
     };
     (
         format!("{name}{octave}   {hz:.1} Hz   {cents:+} cent · {status}"),
+        format!("{name}{octave}   {cents:+} cent"),
         cents as f32,
     )
 }
@@ -373,6 +374,7 @@ pub struct Sound {
     tuner: Option<Tuner>,
     status: [String; 2],
     pub pitch: Option<f32>,
+    pub compact_pitch: String,
     last_beat: u32,
     flash: Option<(u8, Instant)>,
 }
@@ -391,7 +393,7 @@ impl Sound {
             return match slot {
                 0 if self.metronome.is_some() => tr!("In riproduzione", "Playing"),
                 0 => tr!("Fermo", "Stopped"),
-                _ => tr!("La4 = 440 Hz", "A4 = 440 Hz"),
+                _ => tr!("Microfono fermo", "Microphone off"),
             };
         }
         &self.status[slot]
@@ -443,6 +445,7 @@ impl Sound {
         } else {
             self.tuner = None;
             self.pitch = None;
+            self.compact_pitch.clear();
         }
         self.status[slot].clear();
     }
@@ -452,7 +455,7 @@ impl Sound {
         let strength = (1.0 - at.elapsed().as_secs_f32() / 0.16).max(0.0);
         Some((beat, strength))
     }
-    pub fn tick(&mut self) -> bool {
+    pub fn tick(&mut self, reference: u16) -> bool {
         let mut changed = false;
 
         if let Some(stream) = &self.metronome {
@@ -478,12 +481,12 @@ impl Sound {
             changed = true;
         }
         if let Some(tuner) = &self.tuner {
-            let (next, pitch) = if let Some(error) = stream_error(&tuner.error) {
+            let (next, compact, pitch) = if let Some(error) = stream_error(&tuner.error) {
                 self.tuner = None;
-                (error, None)
+                (error, String::new(), None)
             } else if let Some(hz) = tuner.frequency() {
-                let (label, cents) = note(hz);
-                (label, Some(cents))
+                let (label, compact, cents) = note(hz, reference);
+                (label, compact, Some(cents))
             } else {
                 (
                     tr!(
@@ -491,11 +494,13 @@ impl Sound {
                         "Listening… play a sustained note"
                     )
                     .into(),
+                    String::new(),
                     None,
                 )
             };
             changed |= self.pitch != pitch;
             self.pitch = pitch;
+            self.compact_pitch = compact;
             if next != self.status[1] {
                 self.status[1] = next;
                 changed = true;
@@ -508,6 +513,14 @@ impl Sound {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uses_the_configured_reference_to_compute_cents() {
+        let (_, _, cents) = note(442.0, 442);
+        assert_eq!(cents, 0.0);
+        let (_, _, cents) = note(442.0, 440);
+        assert_eq!(cents, 8.0);
+    }
 
     #[test]
     fn extracts_musical_pitch_and_rejects_silence() {

@@ -20,10 +20,45 @@ pub struct Store {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ReadingPosition {
+    pub path: PathBuf,
+    pub page: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Setlist {
     pub id: String,
     pub name: String,
-    pub scores: Vec<PathBuf>,
+    pub scores: Vec<ScoreEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum ScoreEntry {
+    Whole(PathBuf),
+    Range { path: PathBuf, start: u32, end: u32 },
+}
+
+impl ScoreEntry {
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Whole(path) | Self::Range { path, .. } => path,
+        }
+    }
+
+    pub fn range(&self) -> Option<(u32, u32)> {
+        match self {
+            Self::Whole(_) => None,
+            Self::Range { start, end, .. } => Some((*start, *end)),
+        }
+    }
+
+    pub fn new(path: PathBuf, range: Option<(u32, u32)>) -> Self {
+        match range {
+            Some((start, end)) => Self::Range { path, start, end },
+            None => Self::Whole(path),
+        }
+    }
 }
 
 impl Setlist {
@@ -44,121 +79,39 @@ pub struct Settings {
     pub pdf_default_prompt_seen: bool,
     pub bpm: u16,
     pub beats: u8,
+    pub tuning_hz: u16,
     pub pen: Style,
     pub highlighter: Style,
     pub rectangle: Style,
     pub staff: Style,
     pub active_tool: Tool,
-    pub active_preset: Option<u8>,
-    pub(crate) pen_presets: [Option<Style>; 3],
-    pub(crate) highlighter_presets: [Option<Style>; 3],
-    #[serde(default)]
-    pub(crate) updated_tool_defaults: bool,
-    #[serde(skip_serializing)]
-    pub(crate) favorites: [Option<Favorite>; 4],
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
-pub(crate) struct Favorite {
-    highlighter: bool,
-    style: Style,
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Favorites {
+    pen: Vec<Style>,
+    highlighter: Vec<Style>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PresetTool {
+pub enum FavoriteTool {
     Pen,
     Highlighter,
 }
 
-impl Settings {
-    pub fn preset(&self, tool: PresetTool, slot: u8) -> Style {
-        let index = usize::from(slot);
-        let saved = match tool {
-            PresetTool::Pen => self.pen_presets[index],
-            PresetTool::Highlighter => self.highlighter_presets[index],
-        };
-        let settings = Settings::default();
-        saved.unwrap_or_else(|| match tool {
-            PresetTool::Pen => Style {
-                color: [SWATCHES[2], SWATCHES[3], 0x425c1e][index],
-                width: [0.003, 0.010, settings.pen.width][index],
-                ..settings.pen
-            },
-            PresetTool::Highlighter => Style {
-                color: [SWATCHES[8], SWATCHES[7], SWATCHES[4]][index],
-                ..settings.highlighter
-            },
-        })
-    }
-
-    pub fn preset_mut(&mut self, tool: PresetTool, slot: u8) -> &mut Style {
-        let initial = self.preset(tool, slot);
-        let slots = match tool {
-            PresetTool::Pen => &mut self.pen_presets,
-            PresetTool::Highlighter => &mut self.highlighter_presets,
-        };
-        slots[usize::from(slot)].get_or_insert(initial)
-    }
-
-    pub fn selected_preset(&self) -> Option<(PresetTool, u8)> {
-        let slot = self.active_preset.filter(|slot| *slot < 3)?;
-        Some((self.active_tool.preset_group()?, slot))
-    }
-
-    fn migrate_tool_defaults(&mut self) {
-        if self.updated_tool_defaults {
-            return;
+impl Favorites {
+    pub fn styles(&self, tool: FavoriteTool) -> &[Style] {
+        match tool {
+            FavoriteTool::Pen => &self.pen,
+            FavoriteTool::Highlighter => &self.highlighter,
         }
-        let defaults = Self::default();
-        for (style, previous, current) in [
-            (
-                &mut self.pen,
-                Style {
-                    color: 0xb04820,
-                    opacity: 255,
-                    width: 0.0035,
-                },
-                defaults.pen,
-            ),
-            (
-                &mut self.highlighter,
-                Style {
-                    color: 0x32eaff,
-                    opacity: 100,
-                    width: 0.024,
-                },
-                defaults.highlighter,
-            ),
-            (
-                &mut self.rectangle,
-                Style {
-                    color: 0xffffff,
-                    opacity: 255,
-                    width: 0.0,
-                },
-                defaults.rectangle,
-            ),
-        ] {
-            if *style == previous {
-                *style = current;
-            }
-        }
-        self.updated_tool_defaults = true;
     }
 
-    fn migrate_presets(&mut self) {
-        for (index, favorite) in std::mem::take(&mut self.favorites).into_iter().enumerate() {
-            let Some(favorite) = favorite else { continue };
-            let slots = if favorite.highlighter {
-                &mut self.highlighter_presets
-            } else {
-                &mut self.pen_presets
-            };
-            if let Some(slot) = slots.get_mut(index).filter(|slot| slot.is_none()) {
-                *slot = Some(favorite.style);
-            } else if let Some(slot) = slots.iter_mut().find(|slot| slot.is_none()) {
-                *slot = Some(favorite.style);
-            }
+    pub fn styles_mut(&mut self, tool: FavoriteTool) -> &mut Vec<Style> {
+        match tool {
+            FavoriteTool::Pen => &mut self.pen,
+            FavoriteTool::Highlighter => &mut self.highlighter,
         }
     }
 }
@@ -178,6 +131,7 @@ impl Default for Settings {
             pdf_default_prompt_seen: false,
             bpm: 96,
             beats: 4,
+            tuning_hz: 440,
             pen: Style {
                 color: SWATCHES[0],
                 opacity: 255,
@@ -199,11 +153,6 @@ impl Default for Settings {
                 width: 0.0015,
             },
             active_tool: Tool::default(),
-            active_preset: None,
-            pen_presets: [None; 3],
-            highlighter_presets: [None; 3],
-            updated_tool_defaults: true,
-            favorites: [None; 4],
         }
     }
 }
@@ -231,13 +180,37 @@ impl Store {
 
     pub fn settings(&self) -> io::Result<Settings> {
         let mut settings: Settings = read_or_default(&self.root.join("settings.json"))?;
-        settings.migrate_presets();
-        settings.migrate_tool_defaults();
+        settings.tuning_hz = settings.tuning_hz.clamp(400, 480);
         Ok(settings)
+    }
+
+    pub fn favorites(&self) -> io::Result<Favorites> {
+        read_or_default(&self.root.join("tool-favorites.json"))
+    }
+
+    pub fn save_favorites(&self, favorites: &Favorites) -> io::Result<()> {
+        write_json(&self.root.join("tool-favorites.json"), favorites)
     }
 
     pub fn save_settings(&self, settings: &Settings) -> io::Result<()> {
         write_json(&self.root.join("settings.json"), settings)
+    }
+
+    pub fn recent(&self) -> io::Result<Vec<ReadingPosition>> {
+        read_or_default(&self.root.join("recent.json"))
+    }
+
+    pub fn record_reading(&self, position: &ReadingPosition) -> io::Result<Vec<ReadingPosition>> {
+        let mut recent = self.recent()?;
+        recent.retain(|entry| entry.path != position.path);
+        recent.insert(0, position.clone());
+        recent.truncate(50);
+        self.save_recent(&recent)?;
+        Ok(recent)
+    }
+
+    pub fn save_recent(&self, recent: &[ReadingPosition]) -> io::Result<()> {
+        write_json(&self.root.join("recent.json"), recent)
     }
 
     pub fn setlists(&self) -> io::Result<Vec<Setlist>> {
@@ -710,37 +683,24 @@ mod tests {
     }
 
     #[test]
-    fn moves_legacy_presets_to_their_tool_without_sharing_slots() {
+    fn favorites_start_empty_and_store_independent_style_snapshots() {
         let scratch = Scratch::new();
-        let path = scratch.0.join("settings.json");
-        fs::write(
-            &path,
-            r#"{"favorites":[
-            {"highlighter":false,"style":{"color":100,"opacity":255,"width":0.004}},
-            {"highlighter":true,"style":{"color":200,"opacity":90,"width":0.03}},
-            null,
-            {"highlighter":false,"style":{"color":300,"opacity":200,"width":0.007}}
-        ]}"#,
-        )
-        .unwrap();
         let store = Store::at(scratch.0.clone());
-        let mut settings = store.settings().unwrap();
-        assert_eq!(settings.preset(PresetTool::Pen, 0).color, 100);
-        assert_eq!(settings.preset(PresetTool::Highlighter, 1).color, 200);
-        assert_eq!(settings.preset(PresetTool::Pen, 1).color, 300);
-        *settings.preset_mut(PresetTool::Pen, 1) = Style {
-            color: 400,
-            opacity: 180,
-            width: 0.009,
-        };
-        settings.active_tool = Tool::Highlighter;
-        settings.active_preset = Some(1);
-        store.save_settings(&settings).unwrap();
-        let saved = store.settings().unwrap();
-        assert_eq!(saved.selected_preset(), Some((PresetTool::Highlighter, 1)));
-        let pen = saved.preset(PresetTool::Pen, 1);
-        assert_eq!((pen.color, pen.opacity, pen.width), (400, 180, 0.009));
-        assert_eq!(saved.preset(PresetTool::Highlighter, 1).color, 200);
+        let mut favorites = store.favorites().unwrap();
+        assert!(favorites.styles(FavoriteTool::Pen).is_empty());
+        assert!(favorites.styles(FavoriteTool::Highlighter).is_empty());
+        let mut settings = Settings::default();
+        for color in 0..7 {
+            settings.pen.color = color;
+            favorites.styles_mut(FavoriteTool::Pen).push(settings.pen);
+        }
+        favorites.styles_mut(FavoriteTool::Highlighter).push(settings.highlighter);
+        favorites.styles_mut(FavoriteTool::Pen).remove(1);
+        store.save_favorites(&favorites).unwrap();
+        let saved = store.favorites().unwrap();
+        let colors: Vec<_> = saved.styles(FavoriteTool::Pen).iter().map(|style| style.color).collect();
+        assert_eq!(colors, [0, 2, 3, 4, 5, 6]);
+        assert_eq!(saved.styles(FavoriteTool::Highlighter), [settings.highlighter]);
     }
 
     #[test]
@@ -769,6 +729,28 @@ mod tests {
     }
 
     #[test]
+    fn remembers_the_latest_physical_page_and_bounds_history() {
+        let scratch = Scratch::new();
+        let store = Store::at(scratch.0.join("state"));
+        for page in 0..51 {
+            store.record_reading(&ReadingPosition {
+                path: PathBuf::from(format!("score-{page}.pdf")),
+                page,
+            }).unwrap();
+        }
+        store.record_reading(&ReadingPosition {
+            path: PathBuf::from("score-2.pdf"),
+            page: 13,
+        }).unwrap();
+        let recent = store.recent().unwrap();
+        assert_eq!(recent.len(), 50);
+        assert_eq!(recent[0].path, PathBuf::from("score-2.pdf"));
+        assert_eq!(recent[0].page, 13);
+        assert_eq!(recent[1].page, 50);
+        assert!(recent.iter().skip(1).all(|entry| entry.page != 2));
+    }
+
+    #[test]
     fn saves_order_and_preserves_links_when_deleting_a_setlist() {
         let scratch = Scratch::new();
         let first = scratch.0.join("prima.pdf");
@@ -782,13 +764,16 @@ mod tests {
         let copy = store.root.join("scores").join("legacy").join("seconda.pdf");
         fs::create_dir_all(copy.parent().unwrap()).unwrap();
         fs::copy(&second, &copy).unwrap();
-        setlist.scores = vec![first.clone(), copy.clone()];
+        let whole = ScoreEntry::Whole(first.clone());
+        let ranged = ScoreEntry::new(first.clone(), Some((2, 4)));
+        let legacy = ScoreEntry::Whole(copy.clone());
+        setlist.scores = vec![whole.clone(), legacy.clone(), ranged.clone()];
         store.save_setlist(&setlist).unwrap();
         setlist.scores.reverse();
         store.save_setlist(&setlist).unwrap();
         assert_eq!(
             store.setlists().unwrap()[0].scores,
-            [copy.clone(), first.clone()]
+            [ranged, legacy, whole]
         );
         store.delete_setlist(&setlist.id).unwrap();
         assert!(store.setlists().unwrap().is_empty());

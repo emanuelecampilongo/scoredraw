@@ -61,10 +61,11 @@ impl<'a> Score<'a> {
     }
 
     pub fn render(&self, global_page: u32, width: u32, height: u32) -> PdfResult<Frame> {
-        let page = self
-            .document
-            .pages()
-            .get((global_page - self.first_page).try_into()?)?;
+        self.render_page(global_page - self.first_page, width, height)
+    }
+
+    pub fn render_page(&self, pdf_page: u32, width: u32, height: u32) -> PdfResult<Frame> {
+        let page = self.document.pages().get(pdf_page.try_into()?)?;
         let page_width = page.width().value;
         let page_height = page.height().value;
         let scale = (width as f32 / page_width).min(height as f32 / page_height);

@@ -80,12 +80,14 @@ pub struct Touch {
     contacts: Vec<(u32, POINT)>,
     start: POINT,
     transformed: bool,
+    sliding: bool,
 }
 
 pub enum Motion {
     Transform((f32, f32), (f32, f32), f32),
     Tap,
     Turn(i32),
+    Slide(i32),
 }
 
 #[derive(Default)]
@@ -168,6 +170,7 @@ impl Touch {
         if self.contacts.is_empty() {
             self.start = point;
             self.transformed = false;
+            self.sliding = false;
         } else {
             self.transformed = true;
         }
@@ -191,6 +194,14 @@ impl Touch {
         if zoomed && self.contacts.len() == 1 {
             self.transformed = true;
             return Some(Motion::Transform(coords(previous), coords(point), 1.0));
+        }
+        if !self.transformed {
+            let dx = point.x - self.start.x;
+            let dy = point.y - self.start.y;
+            if self.sliding || dx.abs() > (8.0 * scale) as i32 && dx.abs() > dy.abs() * 2 {
+                self.sliding = true;
+                return Some(Motion::Slide(dx));
+            }
         }
         None
     }
@@ -228,17 +239,19 @@ impl Touch {
         }
         let dx = point.x - self.start.x;
         let dy = point.y - self.start.y;
-        if dx.abs() > (48.0 * scale) as i32 && dx.abs() > dy.abs() * 2 {
+        if dx.abs() > (48.0 * scale) as i32 && (self.sliding || dx.abs() > dy.abs() * 2) {
             Some(Motion::Turn(if dx < 0 { 1 } else { -1 }))
-        } else if distance(self.start, point) < 12.0 * scale {
+        } else if !self.sliding && distance(self.start, point) < 12.0 * scale {
             Some(Motion::Tap)
         } else {
             None
         }
     }
 
-    pub fn cancel(&mut self, id: u32) {
+    pub fn cancel(&mut self, id: u32) -> bool {
+        let count = self.contacts.len();
         self.contacts.retain(|(contact, _)| *contact != id);
+        self.contacts.len() != count
     }
 
     fn pair(&self) -> Option<((f32, f32), f32)> {
@@ -281,6 +294,20 @@ fn distance(a: POINT, b: POINT) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn single_finger_slide_tracks_reversal_and_only_turns_past_threshold() {
+        let mut touch = Touch::default();
+        let point = |x| POINT { x, y: 100 };
+        touch.down(1, point(300));
+        assert!(touch.moved(1, point(296), false, 1.0).is_none());
+        assert!(matches!(touch.moved(1, point(220), false, 1.0), Some(Motion::Slide(-80))));
+        assert!(matches!(touch.moved(1, point(312), false, 1.0), Some(Motion::Slide(12))));
+        assert!(touch.up(1, point(301), 1.0).is_none());
+        touch.down(2, point(300));
+        assert!(matches!(touch.moved(2, point(200), false, 1.0), Some(Motion::Slide(-100))));
+        assert!(matches!(touch.up(2, point(200), 1.0), Some(Motion::Turn(1))));
+    }
 
     #[test]
     fn trackpad_motion_accumulates_and_ignores_inertial_page_turns() {

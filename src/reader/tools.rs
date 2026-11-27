@@ -3,18 +3,6 @@ use crate::data::Style;
 use crate::overlay::{Slider, SliderKind};
 
 impl Reader {
-    pub(super) fn ink_settings(&self) -> Settings {
-        let mut settings = self.settings;
-        if let Some((tool, slot)) = self.favorite {
-            let style = settings.preset(tool, slot);
-            match tool {
-                PresetTool::Pen => settings.pen = style,
-                PresetTool::Highlighter => settings.highlighter = style,
-            }
-        }
-        settings
-    }
-
     pub(super) fn commit_settings(&mut self, hwnd: HWND, settings: Settings) -> bool {
         if let Some(store) = &self.store
             && let Err(error) = store.save_settings(&settings)
@@ -32,15 +20,13 @@ impl Reader {
         true
     }
 
-    fn select_tool(&mut self, hwnd: HWND, tool: Tool, slot: Option<u8>) {
+    fn select_tool(&mut self, hwnd: HWND, tool: Tool) {
         self.tool = tool;
-        self.favorite = tool.preset_group().zip(slot);
-        if (self.settings.active_tool, self.settings.active_preset) != (tool, slot) {
+        if self.settings.active_tool != tool {
             self.commit_settings(
                 hwnd,
                 Settings {
                     active_tool: tool,
-                    active_preset: slot,
                     ..self.settings
                 },
             );
@@ -50,17 +36,14 @@ impl Reader {
     pub(super) fn command(&mut self, hwnd: HWND, command: Command) {
         match command {
             Command::Tool(tool) => {
-                self.select_tool(hwnd, tool, None);
+                self.select_tool(hwnd, tool);
                 if self.overlay.drawer && self.overlay.sheet == Some(Sheet::Style) {
                     if !tool.has_options() {
                         self.close_drawer(hwnd);
-                    } else if tool.preset_group().is_none() {
-                        self.preset_editor = false;
                     }
                 }
             }
-            Command::Settings if self.tool.has_options() => {
-                self.preset_editor = false;
+            Command::Settings if self.total > 0 && self.tool.has_options() => {
                 self.open_sheet(hwnd, Sheet::Style);
             }
             Command::Settings => {}
@@ -74,30 +57,19 @@ impl Reader {
             Command::Library => post(hwnd, OPEN_LIBRARY),
             Command::Metronome | Command::Tuner => {
                 let slot = usize::from(command == Command::Tuner);
-                if !self.overlay.toggle_audio(slot) && slot == 1 {
+                if !self.overlay.toggle_audio(slot) {
                     self.sound.stop(slot);
+                    if slot == 0 {
+                        self.tempo_taps.clear();
+                    }
                 }
                 self.close_drawer(hwnd);
             }
-            Command::Panel => {
-                if self.overlay.drawer {
-                    self.close_drawer(hwnd);
-                } else {
-                    self.open_sheet(hwnd, Sheet::Menu);
-                }
-            }
-            Command::Favorite(tool, slot) => {
-                self.select_tool(hwnd, tool.into(), Some(slot));
-            }
-            Command::ToolOptions(tool) => {
-                if self.tool != tool {
-                    self.tool = tool;
-                    self.favorite = None;
-                }
-                self.preset_editor = tool.preset_group().is_some();
+            Command::ToolOptions(tool) if self.total > 0 => {
+                self.select_tool(hwnd, tool);
                 self.open_sheet(hwnd, Sheet::Style);
             }
-            Command::Shapes | Command::Back => {}
+            Command::ToolOptions(_) | Command::Shapes | Command::Back => {}
         }
         repaint(hwnd);
     }
@@ -108,29 +80,18 @@ impl Reader {
         }
         self.hide_utilities(hwnd);
         self.chrome_menu = None;
+        if self.page_grid_open() { self.leave_page_grid(); }
         self.overlay.open(sheet);
-        if sheet == Sheet::Page {
-            self.overlay.page_score = self
-                .scores
-                .iter()
-                .rposition(|score| score.first_page <= self.selected)
-                .unwrap_or(0);
-            if let Some(score) = self.current_score() {
-                self.overlay.page_input = (self.selected - score.first_page + 1).to_string();
-            }
-            self.overlay.page_replace = true;
-        }
+        if sheet == Sheet::Page { self.start_page_grid(hwnd); }
         if sheet == Sheet::Bookmarks {
             self.load_bookmarks(hwnd);
-        }
-        if sheet == Sheet::Style {
-            self.preset_saved = None;
         }
         self.animate(hwnd);
         repaint(hwnd);
     }
 
     pub(super) fn close_drawer(&mut self, hwnd: HWND) {
+        if self.page_grid_open() { self.leave_page_grid(); }
         self.overlay.close();
         self.reveal_utilities(hwnd);
         self.animate(hwnd);
@@ -142,23 +103,8 @@ impl Reader {
             self.overlay.grab = None;
             self.bookmark_drag = None;
             self.bookmark_scroll_y = None;
-            let _ = unsafe { KillTimer(Some(hwnd), PAGE_ERASE_TIMER) };
             let _ = unsafe { KillTimer(Some(hwnd), BOOKMARK_DRAG_TIMER) };
             self.finish_slider(hwnd);
-        }
-    }
-
-    pub(super) fn erase_page_hold(&mut self, hwnd: HWND) {
-        let _ = unsafe { KillTimer(Some(hwnd), PAGE_ERASE_TIMER) };
-        if self
-            .overlay
-            .grab
-            .is_some_and(|grab| grab.event == Some(Event::PageErase))
-        {
-            self.page_long_erase = true;
-            self.overlay.page_input.clear();
-            self.overlay.page_replace = false;
-            repaint(hwnd);
         }
     }
 
@@ -169,6 +115,7 @@ impl Reader {
             self.overlay.utilities = false;
             self.overlay.zoom_slider = false;
             self.repaint_utilities(hwnd);
+            self.animate(hwnd);
         }
     }
 
@@ -179,6 +126,7 @@ impl Reader {
         self.utilities_activity = Some(Instant::now());
         if !self.overlay.utilities {
             self.overlay.utilities = true;
+            self.animate(hwnd);
             self.repaint_utilities(hwnd);
             unsafe {
                 SetTimer(
@@ -209,8 +157,8 @@ impl Reader {
         repaint_rect(
             hwnd,
             RECT {
-                left: (middle - layout.px(285)).max(layout.viewport.left),
-                right: (middle + layout.px(285)).min(layout.viewport.right),
+                left: (middle - layout.px(314)).max(layout.viewport.left),
+                right: (middle + layout.px(314)).min(layout.viewport.right),
                 top: (layout.viewport.bottom - layout.px(141)).max(layout.viewport.top),
                 bottom: layout.viewport.bottom,
             },
@@ -225,7 +173,7 @@ impl Reader {
                     return grab.id == id;
                 }
                 let cards = self.cards(&layout);
-                let Some(card) = cards.iter().rev().find(|card| inside(card.rect, at)) else {
+                let Some(card) = cards.iter().rev().find(|card| (!card.dock || self.overlay.utilities) && card.opacity > 0.04 && inside(card.rect, at)) else {
                     if self.chrome_menu.take().is_some() {
                         self.overlay.grab = Some(overlay::Grab::dismiss(id, at));
                         repaint(hwnd);
@@ -233,7 +181,14 @@ impl Reader {
                     }
                     return false;
                 };
+                if !card.interactive {
+                    self.overlay.grab = Some(overlay::Grab::dismiss(id, at));
+                    return true;
+                }
                 let mut grab = card.grab(id, at);
+                if card.favorite_clip.is_some_and(|clip| inside(clip, at)) {
+                    grab.favorite_scroll = Some((self.overlay.favorite_scroll, card.scale));
+                }
                 if self.chrome_menu.is_some()
                     && self
                         .chrome_card(&layout)
@@ -243,10 +198,6 @@ impl Reader {
                     grab = overlay::Grab::dismiss(id, at);
                 }
                 self.overlay.grab = Some(grab);
-                if grab.event == Some(Event::PageErase) {
-                    self.page_long_erase = false;
-                    unsafe { SetTimer(Some(hwnd), PAGE_ERASE_TIMER, 450, None) };
-                }
                 if matches!(grab.event, Some(Event::BookmarkDrag(_))) {
                     unsafe { SetTimer(Some(hwnd), BOOKMARK_DRAG_TIMER, 170, None) };
                 }
@@ -259,29 +210,23 @@ impl Reader {
             WM_POINTERUPDATE if self.overlay.grab.is_some_and(|grab| grab.id == id) => {
                 if let Some(grab) = self.overlay.grab {
                     let dy = at.y - grab.origin.y;
+                    if let Some((start, scale)) = grab.favorite_scroll
+                        && (dy.abs() >= layout.px(5) || self.bookmark_scroll_y.is_some())
+                    {
+                        self.set_favorite_scroll(start - dy as f32 / scale);
+                        self.bookmark_scroll_y = Some(at.y);
+                    }
                     match grab.event {
                         Some(Event::BookmarkDrag(_)) => self.bookmark_drag = Some(at),
-                        Some(Event::BookmarkSelect(_) | Event::PageScore(_))
+                        Some(Event::BookmarkSelect(_))
                             if dy.abs() > layout.px(24) || self.bookmark_scroll_y.is_some() =>
                         {
                             let origin = self.bookmark_scroll_y.unwrap_or(grab.origin.y);
                             let step = (origin - at.y) / layout.px(38).max(1);
                             if step != 0 {
-                                if self.overlay.page_scores_open
-                                    && self.overlay.sheet == Some(Sheet::Page)
-                                {
-                                    self.scroll_page_scores(step);
-                                } else {
-                                    self.scroll_bookmarks(step);
-                                }
+                                self.scroll_bookmarks(step);
                                 self.bookmark_scroll_y = Some(at.y);
                             }
-                        }
-                        Some(Event::PageErase)
-                            if dy.abs() > layout.px(24)
-                                || (at.x - grab.origin.x).abs() > layout.px(24) =>
-                        {
-                            let _ = unsafe { KillTimer(Some(hwnd), PAGE_ERASE_TIMER) };
                         }
                         _ => {}
                     }
@@ -290,22 +235,22 @@ impl Reader {
                     self.preview_slider(hwnd, slider, at.x);
                 } else {
                     self.overlay.move_to(id, at, layout.viewport);
+                    if self.overlay.audio_visible() {
+                        self.animate(hwnd);
+                    }
                 }
             }
             WM_POINTERUP if self.overlay.grab.is_some_and(|grab| grab.id == id) => {
-                let _ = unsafe { KillTimer(Some(hwnd), PAGE_ERASE_TIMER) };
-                let _ = unsafe { KillTimer(Some(hwnd), BOOKMARK_DRAG_TIMER) };
+                    let _ = unsafe { KillTimer(Some(hwnd), BOOKMARK_DRAG_TIMER) };
                 let grab = self.overlay.grab.take();
                 let swiped = self.bookmark_scroll_y.take().is_some();
                 self.bookmark_drag = None;
-                let erased = std::mem::take(&mut self.page_long_erase);
                 if let Some(slider) = grab.and_then(|grab| grab.slider) {
                     self.preview_slider(hwnd, slider, at.x);
                     self.finish_slider(hwnd);
                 } else if let Some(Event::BookmarkDrag(index)) = grab.and_then(|grab| grab.event) {
                     self.drop_bookmark(hwnd, &layout, index, at);
                 } else if !swiped
-                    && !erased
                     && let Some(event) = grab.and_then(|grab| grab.event)
                     && self
                         .cards(&layout)
@@ -313,9 +258,7 @@ impl Reader {
                         .rev()
                         .find(|card| inside(card.rect, at))
                         .is_some_and(|card| {
-                            card.buttons.iter().any(|button| {
-                                button.enabled && button.event == event && inside(button.rect, at)
-                            })
+                            card.grab(id, at).event == Some(event)
                         })
                 {
                     self.chrome_menu = None;
@@ -332,17 +275,9 @@ impl Reader {
     }
 
     pub(super) fn cards(&self, layout: &Layout) -> Vec<overlay::Card> {
-        let page = if self.overlay.page_input.is_empty() {
-            "—".into()
-        } else {
-            self.overlay.page_input.clone()
-        };
-        let range = self
-            .scores
-            .get(self.overlay.page_score)
-            .map_or_else(String::new, |s| trf!("Pagina 1–{}", "Page 1–{}", s.count));
+        if self.page_grid_open() { return self.chrome_card(layout).into_iter().collect(); }
         let page_indicator = self.current_score().map_or_else(String::new, |s| {
-            format!("{} / {}", self.selected - s.first_page + 1, s.count)
+            format!("{} / {}", s.pdf_page(self.selected) + 1, s.pdf_count)
         });
         let indices = if self.overlay.drawer && self.overlay.sheet == Some(Sheet::Bookmarks) {
             self.visible_bookmarks()
@@ -377,38 +312,36 @@ impl Reader {
                     .collect()
             })
             .unwrap_or_default();
+        let chrome = self.chrome_card(layout);
         let mut cards = self.overlay.cards(
             layout.viewport,
             layout.scale,
             &overlay::Model {
                 fullscreen: self.fullscreen.is_some(),
+                popup: chrome.as_ref().map(|card| card.rect).or_else(|| self.chrome_visual.and_then(|menu| self.chrome_card_for(layout, menu)).map(|card| card.rect)),
                 zoom: self.view.zoom(),
                 tap: self.settings.tap_turn,
                 language: self.settings.language,
-                page,
-                page_range: range,
-                page_target_valid: self.page_destination().is_some(),
-                page_can_erase: !self.overlay.page_input.is_empty(),
-                scores: &self.scores,
                 page_loaded: self.total > 0,
                 page_indicator,
                 undo: self.can_undo(),
                 redo: self.can_redo(),
                 can_turn: [self.selected > 0, self.selected + 1 < self.total],
-                can_finalize: self.can_finalize(),
+                concert_navigation: self.concert.then(|| {
+                    [self.score_destination(-1).is_some(), self.score_destination(1).is_some()]
+                }),
                 can_add_bookmark: self.bookmarks.is_some() && !self.original_export,
                 bpm: self.settings.bpm,
                 beats: self.settings.beats,
+                tuning_hz: self.settings.tuning_hz,
+                compact_pitch: &self.sound.compact_pitch,
                 running: [self.sound.running(0), self.sound.running(1)],
                 audio_status: [self.sound.status(0), self.sound.status(1)],
                 pitch: self.sound.pitch,
                 pulse: self.sound.pulse(),
                 tool: self.tool,
-                style: self.tool.style(&self.ink_settings()),
-                preset_editor: self.preset_editor,
-                preset_saved: self.preset_saved.and_then(|(group, slot)| {
-                    (Some(group) == self.tool.preset_group()).then_some(slot)
-                }),
+                style: self.tool.style(&self.settings),
+                favorites: self.tool.favorite_group().map(|tool| self.favorites.styles(tool)),
                 bookmarks: &rows,
                 selected_bookmark: self.overlay.selected_bookmark,
                 bookmark_status: &self.bookmark_status,
@@ -424,7 +357,7 @@ impl Reader {
         {
             cards.insert(0, banner);
         }
-        if let Some(card) = self.chrome_card(layout) {
+        if let Some(card) = chrome {
             cards.push(card);
         }
         cards
@@ -443,6 +376,11 @@ impl Reader {
             Event::ToggleZoom => self.overlay.zoom_slider = !self.overlay.zoom_slider,
             Event::ZoomStep(step) => self.zoom_step(hwnd, step),
             Event::Turn(step) => self.turn(hwnd, step),
+            Event::ScoreTurn(step) => {
+                if let Some(page) = self.score_destination(step) {
+                    self.go_to(hwnd, page);
+                }
+            }
             Event::About => self.open_sheet(hwnd, Sheet::About),
             Event::DeleteShape => self.delete_shape(hwnd),
             Event::ToggleTap => {
@@ -463,39 +401,6 @@ impl Reader {
                     }
                 }
             }
-            Event::PageDigit(digit) => {
-                if std::mem::take(&mut self.overlay.page_replace) {
-                    self.overlay.page_input.clear();
-                }
-                if self.overlay.page_input.len() < 10 {
-                    self.overlay.page_input.push(char::from(b'0' + digit));
-                }
-            }
-            Event::PageErase => {
-                self.overlay.page_replace = false;
-                self.overlay.page_input.pop();
-            }
-            Event::PageGo => self.jump_to_page(hwnd),
-            Event::PageScores => {
-                self.overlay.page_scores_open = !self.overlay.page_scores_open;
-                if self.overlay.page_scores_open {
-                    self.overlay.page_score_offset = self
-                        .overlay
-                        .page_score
-                        .min(self.scores.len().saturating_sub(overlay::PAGE_SCORE_ROWS));
-                }
-            }
-            Event::PageScore(index) => {
-                if index < self.scores.len() {
-                    if index != self.overlay.page_score {
-                        self.overlay.page_input = "1".into();
-                        self.overlay.page_replace = true;
-                    }
-                    self.overlay.page_score = index;
-                    self.overlay.page_scores_open = false;
-                }
-            }
-            Event::PageScoreScroll(step) => self.scroll_page_scores(step),
             Event::BookmarkSelect(index) => {
                 self.overlay.selected_bookmark = Some(index);
                 self.go_to_bookmark(hwnd);
@@ -526,20 +431,20 @@ impl Reader {
             }
             Event::OpenStore => store_update::open_listing(hwnd),
             Event::DismissStoreUpdate => self.store_update_available = false,
-            Event::SavePreset(slot) => {
-                let Some(tool) = self.tool.preset_group() else {
-                    return;
-                };
-                let mut settings = self.settings;
-                *settings.preset_mut(tool, slot) = self.tool.style(&self.ink_settings());
-                settings.active_tool = self.tool;
-                settings.active_preset = Some(slot);
-                if self.commit_settings(hwnd, settings) {
-                    self.favorite = Some((tool, slot));
-                    self.preset_saved = Some((tool, slot));
-                    unsafe { SetTimer(Some(hwnd), PRESET_SAVED_TIMER, 1600, None) };
+            Event::AddFavorite => self.save_favorite(hwnd, None),
+            Event::DeleteFavorite(index) => self.save_favorite(hwnd, Some(index)),
+            Event::LoadFavorite(index) => {
+                if let Some(group) = self.tool.favorite_group()
+                    && let Some(&style) = self.favorites.styles(group).get(index)
+                {
+                    let mut settings = self.settings;
+                    if let Some(current) = Self::style_mut(&mut settings, self.tool) {
+                        *current = style;
+                        self.commit_settings(hwnd, settings);
+                    }
                 }
             }
+            Event::CloseDocument => self.close_document(hwnd),
             Event::CustomColor => post(hwnd, OPEN_PREFERENCES),
             Event::Licenses => post(hwnd, SHOW_ABOUT),
             Event::Feedback => post(hwnd, SHOW_FEEDBACK),
@@ -558,12 +463,21 @@ impl Reader {
                 unsafe { SetTimer(Some(hwnd), AUDIO_TIMER, 33, None) };
             }
             Event::AudioClose(slot) => {
-                self.overlay.toggle_audio(slot);
-                if slot == 1 {
-                    self.sound.stop(slot);
+                self.overlay.close_audio(slot);
+                self.sound.stop(slot);
+                self.animate(hwnd);
+                if slot == 0 {
+                    self.tempo_taps.clear();
                 }
             }
+            Event::AudioCompact(slot) => {
+                self.overlay.toggle_compact(slot);
+                self.animate(hwnd);
+            }
+            Event::TapTempo => self.tap_tempo(hwnd, Instant::now()),
+            Event::EditTuning => post(hwnd, EDIT_TUNING),
             Event::Bpm(delta) => {
+                self.tempo_taps.clear();
                 self.adjust_tempo(
                     hwnd,
                     self.settings
@@ -589,6 +503,75 @@ impl Reader {
         repaint(hwnd);
     }
 
+    fn set_favorite_scroll(&mut self, scroll: f32) {
+        let count = self.tool.favorite_group().map_or(0, |tool| self.favorites.styles(tool).len());
+        self.overlay.favorite_scroll = scroll.clamp(0.0, overlay::favorite_max_scroll(count));
+    }
+
+    pub(super) fn favorite_wheel(&mut self, hwnd: HWND, point: POINT, delta: i32) -> bool {
+        if !self.overlay.drawer || self.overlay.sheet != Some(Sheet::Style) {
+            return false;
+        }
+        let layout = Layout::new(hwnd, self.fullscreen.is_some());
+        if !self.cards(&layout).iter().any(|card| card.favorite_clip.is_some_and(|clip| inside(clip, point))) {
+            return false;
+        }
+        self.set_favorite_scroll(self.overlay.favorite_scroll - delta as f32 * 0.42);
+        repaint(hwnd);
+        true
+    }
+
+    fn save_favorite(&mut self, hwnd: HWND, delete: Option<usize>) {
+        let Some(group) = self.tool.favorite_group() else { return };
+        let mut favorites = self.favorites.clone();
+        let styles = favorites.styles_mut(group);
+        if let Some(index) = delete {
+            if index >= styles.len() { return }
+            styles.remove(index);
+        } else {
+            styles.push(self.tool.style(&self.settings));
+        }
+        let last = overlay::favorite_max_scroll(styles.len());
+        if let Some(store) = &self.store
+            && let Err(error) = store.save_favorites(&favorites)
+        {
+            self.notify(hwnd, trf!("Impossibile salvare i preferiti · {error}", "Could not save favorites · {error}"));
+            return;
+        }
+        self.favorites = favorites;
+        self.overlay.favorite_scroll = if delete.is_some() {
+            self.overlay.favorite_scroll.min(last)
+        } else {
+            last
+        };
+    }
+
+    fn tap_tempo(&mut self, hwnd: HWND, now: Instant) {
+        if let Some(last) = self.tempo_taps.back() {
+            let gap = now.duration_since(*last);
+            if gap < Duration::from_millis(180) {
+                return;
+            }
+            if gap > Duration::from_secs(2) {
+                self.tempo_taps.clear();
+            }
+        }
+        self.tempo_taps.push_back(now);
+        if self.tempo_taps.len() > 5 {
+            self.tempo_taps.pop_front();
+        }
+        if let Some(first) = self.tempo_taps.front()
+            && self.tempo_taps.len() > 1
+        {
+            let bpm = (60.0 * (self.tempo_taps.len() - 1) as f64 / now.duration_since(*first).as_secs_f64())
+                .round() as u16;
+            let bpm = bpm.clamp(30, 300);
+            if bpm != self.settings.bpm {
+                self.adjust_tempo(hwnd, bpm, self.settings.beats);
+            }
+        }
+    }
+
     fn adjust_tempo(&mut self, hwnd: HWND, bpm: u16, beats: u8) {
         let settings = Settings {
             bpm,
@@ -602,7 +585,7 @@ impl Reader {
 
     fn update_style(&mut self, hwnd: HWND, event: Event) {
         let mut settings = self.settings;
-        let Some(style) = Self::style_mut(&mut settings, self.tool, self.favorite) else {
+        let Some(style) = Self::style_mut(&mut settings, self.tool) else {
             return;
         };
         match event {
@@ -618,21 +601,13 @@ impl Reader {
         self.commit_settings(hwnd, settings);
     }
 
-    fn style_mut(
-        settings: &mut Settings,
-        tool: Tool,
-        favorite: Option<(PresetTool, u8)>,
-    ) -> Option<&mut Style> {
-        if let Some((group, slot)) = favorite {
-            Some(settings.preset_mut(group, slot))
-        } else {
-            match tool {
-                Tool::Pen => Some(&mut settings.pen),
-                Tool::Highlighter => Some(&mut settings.highlighter),
-                Tool::Staff => Some(&mut settings.staff),
-                Tool::Rectangle => Some(&mut settings.rectangle),
-                _ => None,
-            }
+    fn style_mut(settings: &mut Settings, tool: Tool) -> Option<&mut Style> {
+        match tool {
+            Tool::Pen => Some(&mut settings.pen),
+            Tool::Highlighter => Some(&mut settings.highlighter),
+            Tool::Staff => Some(&mut settings.staff),
+            Tool::Rectangle => Some(&mut settings.rectangle),
+            _ => None,
         }
     }
 
@@ -641,7 +616,7 @@ impl Reader {
         match slider.kind {
             SliderKind::Zoom => self.zoom_to(hwnd, 1.0 + (300.0 * ratio).round() / 100.0),
             SliderKind::Width | SliderKind::Opacity => {
-                if let Some(style) = Self::style_mut(&mut self.settings, self.tool, self.favorite) {
+                if let Some(style) = Self::style_mut(&mut self.settings, self.tool) {
                     if slider.kind == SliderKind::Width {
                         style.width = overlay::width_from_ratio(ratio);
                     } else {
@@ -651,6 +626,7 @@ impl Reader {
             }
             SliderKind::Bpm | SliderKind::Beats => {
                 if slider.kind == SliderKind::Bpm {
+                    self.tempo_taps.clear();
                     self.settings.bpm = (30.0 + 270.0 * ratio).round() as u16;
                 } else {
                     self.settings.beats = (1.0 + 11.0 * ratio).round() as u8;
@@ -678,70 +654,17 @@ impl Reader {
         self.transform_view(hwnd, center, center, level / self.view.zoom());
     }
 
-    pub(super) fn page_key(&mut self, hwnd: HWND, key: usize) -> bool {
-        if !self.overlay.drawer || self.overlay.sheet != Some(Sheet::Page) {
-            return false;
-        }
-        if self.overlay.page_scores_open {
-            let event = match key {
-                0x1b => Event::PageScores,
-                0x26 => Event::PageScoreScroll(-1),
-                0x28 => Event::PageScoreScroll(1),
-                _ => return matches!(key, 0x20 | 0x21 | 0x22 | 0x25 | 0x27 | 0x0d),
-            };
-            self.event(hwnd, event);
-            return true;
-        }
-        let event = match key {
-            0x30..=0x39 => Event::PageDigit((key - 0x30) as u8),
-            0x60..=0x69 => Event::PageDigit((key - 0x60) as u8),
-            0x08 => Event::PageErase,
-            0x0d => Event::PageGo,
-            _ => return false,
-        };
-        self.event(hwnd, event);
-        true
-    }
-
-    fn jump_to_page(&mut self, hwnd: HWND) {
-        if let Some(destination) = self.page_destination() {
-            self.go_to(hwnd, destination);
-            self.close_drawer(hwnd);
-        }
-    }
-
-    fn page_destination(&self) -> Option<u32> {
-        let score = self.scores.get(self.overlay.page_score)?;
-        let page = self.overlay.page_input.parse::<u32>().ok()?;
-        (1..=score.count)
-            .contains(&page)
-            .then(|| score.first_page + page - 1)
-    }
-
-    fn scroll_page_scores(&mut self, step: i32) {
-        self.overlay.page_score_offset = self
-            .overlay
-            .page_score_offset
-            .saturating_add_signed(step as isize)
-            .min(self.scores.len().saturating_sub(overlay::PAGE_SCORE_ROWS));
-    }
-
-    pub(super) fn page_score_wheel(&mut self, hwnd: HWND, delta: i32) -> bool {
-        if self.overlay.drawer
-            && self.overlay.sheet == Some(Sheet::Page)
-            && self.overlay.page_scores_open
-        {
-            self.scroll_page_scores(-delta.signum());
-            repaint(hwnd);
-            true
-        } else {
-            false
-        }
-    }
     pub(super) fn current_score(&self) -> Option<&ScoreInfo> {
         self.scores.iter().rev().find(|score| {
             self.selected >= score.first_page && self.selected - score.first_page < score.count
         })
+    }
+
+    pub(super) fn score_destination(&self, step: i32) -> Option<u32> {
+        if !self.concert { return None; }
+        let current = self.scores.iter().rposition(|score| score.first_page <= self.selected)?;
+        let next = current.checked_add_signed(step as isize)?;
+        self.scores.get(next).map(|score| score.first_page)
     }
 
     fn go_to_bookmark(&mut self, hwnd: HWND) {
@@ -755,8 +678,8 @@ impl Reader {
         let Some(score) = self.current_score() else {
             return;
         };
-        if let Some(page) = entry.page.filter(|page| (1..=score.count).contains(page)) {
-            self.go_to(hwnd, score.first_page + page - 1);
+        if let Some(page) = entry.page.and_then(|page| score.index(page.checked_sub(1)?)) {
+            self.go_to(hwnd, page);
             self.close_drawer(hwnd);
         } else {
             self.notify(
@@ -995,13 +918,16 @@ impl Reader {
                         let files = self
                             .scores
                             .iter()
-                            .map(|score| score.source.path.clone())
+                            .map(|score| score.entry.clone())
                             .collect();
                         let selected = self.selected;
                         let concert = self.concert;
-                        self.open(hwnd, files, false);
-                        self.concert = concert;
-                        self.resume_page = Some(selected);
+                        let session = self.session;
+                        self.open_entries(hwnd, files, false);
+                        if self.session != session {
+                            self.concert = concert;
+                            self.resume_page = Some(selected);
+                        }
                     }
                     if !result.failed.is_empty() {
                         self.export_report = Some(result.failure_report());
@@ -1043,26 +969,62 @@ impl Reader {
         }
     }
 
+    pub(super) fn hover_overlays(&mut self, hwnd: HWND, point: Option<POINT>) {
+        let previous = std::mem::replace(&mut self.overlay_hover, point);
+        if previous == point { return; }
+        let layout = Layout::new(hwnd, self.fullscreen.is_some());
+        for card in self.cards(&layout) {
+            let button = |at| card.grab(MOUSE, at).event;
+            if previous.and_then(button) != point.and_then(button) {
+                repaint_rect(hwnd, card.rect);
+            }
+        }
+    }
+
     pub(super) fn draw_overlays(&self, dc: HDC, layout: &Layout, damage: RECT) {
-        for card in self.cards(layout) {
-            if intersect(card.rect, damage).is_none() {
+        let mut cards = self.cards(layout);
+        if self.chrome_menu.is_none()
+            && let Some(menu) = self.chrome_visual
+            && let Some(card) = self.chrome_card_for(layout, menu)
+        {
+            cards.push(card);
+        }
+        for card in cards {
+            let damage = if card.drawer {
+                let Some(clip) = intersect(layout.viewport, damage) else { continue };
+                clip
+            } else { damage };
+            let Some(affected) = intersect(card.rect, damage) else { continue };
+            if card.opacity <= 0.0 {
                 continue;
             }
+            with_clip(dc, affected, || {
+            let background = if card.opacity < 1.0 {
+                Surface::new(dc, affected.right - affected.left, affected.bottom - affected.top).map(|surface| {
+                    let w = affected.right - affected.left;
+                    let h = affected.bottom - affected.top;
+                    unsafe {
+                        let _ = BitBlt(surface.dc, 0, 0, w, h, Some(dc), affected.left, affected.top, SRCCOPY);
+                    }
+                    surface
+                })
+            } else { None };
             let px = |n: f32| (n * card.scale).round() as i32;
             rounded(dc, card.rect, PANEL, px(28.0));
+            if let Some(section) = card.section {
+                rounded(dc, section, BACKGROUND, px(20.0));
+            }
             for separator in card.separators {
                 rounded(dc, separator, MENU_BORDER, px(2.0));
             }
-            for label in card.labels {
-                text(
-                    dc,
-                    label.rect,
-                    &label.text,
-                    if label.muted { MUTED } else { TEXT },
-                    px(label.size as f32),
-                );
-            }
             for control in card.buttons {
+                let clip = if control.event.is_favorite_row() {
+                    card.favorite_clip.unwrap_or(card.rect)
+                } else {
+                    card.rect
+                };
+                let hot = control.enabled && self.overlay_hover.is_some_and(|at| inside(clip, at) && inside(control.rect, at));
+                with_clip(dc, clip, || {
                 if let Some(color) = control.color {
                     if control.active {
                         rounded(dc, control.rect, ACCENT, px(19.0));
@@ -1077,11 +1039,16 @@ impl Reader {
                     rounded(dc, rect, color, px(15.0));
                 } else if let Some(icon) = control.icon {
                     if control.text.is_empty() {
-                        icon_button(dc, control.rect, icon, control.enabled, card.scale);
+                        if hot {
+                            rounded(dc, control.rect, blend_color(SURFACE, ACCENT, 15), px(19.0));
+                            icons::draw(dc, icon, control.rect, 20.0 * card.scale, TEXT);
+                        } else {
+                            icon_button(dc, control.rect, icon, control.enabled, card.scale);
+                        }
                     } else {
                         let foreground = if control.enabled { TEXT } else { MUTED };
                         if control.enabled {
-                            rounded(dc, control.rect, SURFACE, px(16.0));
+                            rounded(dc, control.rect, if hot { blend_color(SURFACE, ACCENT, 15) } else { SURFACE }, px(16.0));
                         }
                         let glyph = RECT {
                             left: control.rect.left + px(11.0),
@@ -1103,9 +1070,42 @@ impl Reader {
                     }
                 } else if !control.enabled {
                     text(dc, control.rect, &control.text, MENU_BORDER, px(14.0));
+                } else if hot && !control.active {
+                    rounded(dc, control.rect, blend_color(SURFACE, ACCENT, 15), px(19.0));
+                    text(dc, control.rect, &control.text, TEXT, px(14.0));
                 } else {
                     button(dc, control.rect, &control.text, control.active, card.scale);
                 }
+                });
+            }
+            for (index, label) in card.labels.into_iter().enumerate() {
+                let clip = if index >= card.favorite_labels_start {
+                    card.favorite_clip.unwrap_or(card.rect)
+                } else {
+                    card.rect
+                };
+                with_clip(dc, clip, || text(
+                    dc,
+                    label.rect,
+                    &label.text,
+                    if label.dark { BACKGROUND } else if label.muted { MUTED } else { TEXT },
+                    px(label.size as f32),
+                ));
+            }
+            with_clip(dc, card.favorite_clip.unwrap_or(card.rect), || for (rect, style) in card.strokes {
+                rounded(dc, rect, COLORREF(0x00dedede), px(8.0));
+                if let Some(canvas) = Canvas::new(dc)
+                    && let Some(path) = canvas::Path::new()
+                {
+                    let y = (rect.top + rect.bottom) as f32 / 2.0;
+                    path.line(((rect.left + px(12.0)) as f32, y), ((rect.right - px(12.0)) as f32, y));
+                    canvas.stroke_path(&path,
+                        canvas::argb(COLORREF(style.color), style.opacity),
+                        (style.width * 220.0).clamp(1.0, 14.0) * card.scale);
+                }
+            });
+            if let Some(thumb) = card.favorite_thumb {
+                rounded(dc, thumb, MUTED, px(3.0));
             }
             if let Some((rect, meter)) = card.meter {
                 draw_meter(dc, rect, meter, card.scale);
@@ -1113,6 +1113,15 @@ impl Reader {
             for slider in card.sliders {
                 draw_slider(dc, slider, card.scale);
             }
+            if let Some(background) = background {
+                let w = affected.right - affected.left;
+                let h = affected.bottom - affected.top;
+                unsafe {
+                    let _ = AlphaBlend(dc, affected.left, affected.top, w, h, background.dc, 0, 0, w, h,
+                        BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, SourceConstantAlpha: ((1.0 - card.opacity) * 255.0).round() as u8, ..Default::default() });
+                }
+            }
+            });
         }
         if let Some(at) = self.bookmark_drag {
             let mark = RECT {
@@ -1607,14 +1616,14 @@ pub(super) fn bookmark_dialog(hwnd: HWND, state: &RefCell<Reader>) {
                 entry.page,
             )
         } else {
-            let page = app.selected - score.first_page + 1;
+            let page = score.pdf_page(app.selected) + 1;
             (
                 tr!("Nuovo segnalibro", "New bookmark"),
                 trf!("Pagina {page}", "Page {page}"),
                 Some(page),
             )
         };
-        (event, caption, title, page, score.count)
+        (event, caption, title, page, score.pdf_count)
     };
     let page = original_page.map_or_else(String::new, |page| page.to_string());
     match crate::dialog::bookmark_fields(hwnd, caption, &title, &page) {

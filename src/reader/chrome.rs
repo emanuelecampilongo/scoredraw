@@ -295,17 +295,21 @@ impl Reader {
 
 impl Reader {
     pub(super) fn chrome_card(&self, layout: &Layout) -> Option<overlay::Card> {
+        self.chrome_card_for(layout, self.chrome_menu?)
+    }
+
+    pub(super) fn chrome_card_for(&self, layout: &Layout, menu: Menu) -> Option<overlay::Card> {
         use Command as C;
         use Event as E;
-        let menu = self.chrome_menu?;
         let strip = layout.strip?;
         let (_, _, anchor) = strip.tabs().find(|(id, _, _)| *id == menu)?;
         let s = self.total > 0;
-        let tool = trf!(
+        let has_options = s && self.tool.has_options();
+        let tool = if has_options { trf!(
             "Opzioni · {}",
             "Options · {}",
             Command::Tool(self.tool).label()
-        );
+        ) } else { tr!("Opzioni strumento corrente", "Current tool options").into() };
         let entries: &[(&str, Glyph, Event, bool)] = match menu {
             Menu::File => &[
                 (
@@ -322,9 +326,15 @@ impl Reader {
                 ),
                 (
                     tr!("Rendi modifiche permanenti…", "Make changes permanent…"),
-                    Glyph::Check,
+                    Glyph::Save,
                     E::Finalize,
                     self.can_finalize(),
+                ),
+                (
+                    tr!("Home", "Home"),
+                    Glyph::Home,
+                    E::CloseDocument,
+                    self.total > 0 && self.exporting.is_none(),
                 ),
             ],
             Menu::Edit => &[
@@ -341,7 +351,7 @@ impl Reader {
                     self.can_redo(),
                 ),
                 (
-                    tr!("Elimina forma", "Delete shape"),
+                    tr!("Elimina oggetto selezionato", "Delete selected object"),
                     Glyph::Trash,
                     E::DeleteShape,
                     self.can_delete_shape(),
@@ -352,7 +362,7 @@ impl Reader {
                     tr!("Schermo intero", "Full screen"),
                     Glyph::Expand,
                     E::Command(C::Fullscreen),
-                    true,
+                    s,
                 ),
                 (
                     tr!("Vai a pagina…", "Go to page…"),
@@ -390,7 +400,7 @@ impl Reader {
                     &tool,
                     C::Tool(self.tool).icon(),
                     E::Command(C::Settings),
-                    self.tool.has_options(),
+                    has_options,
                 ),
                 (
                     tr!("Preferenze…", "Settings…"),
@@ -414,12 +424,13 @@ impl Reader {
         let x = anchor.left.min((layout.client.right - width).max(0));
         let mut card = overlay::Card::new(
             x,
-            strip.rect.bottom + px(3),
+            strip.rect.bottom + px(3) - px((4.0 * (1.0 - self.overlay.popup_opacity)).round() as i32),
             width,
             px(16 + 53 * entries.len() as i32),
             strip.scale,
             None,
         );
+        card.opacity = self.overlay.popup_opacity;
         for (i, &(label, icon, event, enabled)) in entries.iter().enumerate() {
             card.menu_item([8, 8 + 53 * i as i32, 284, 48], label, icon, event, enabled);
         }

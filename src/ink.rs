@@ -1,5 +1,5 @@
 use crate::canvas::{self, Canvas, Path};
-use crate::data::{self, PresetTool, Settings, Style};
+use crate::data::{self, FavoriteTool, Settings, Style};
 use crate::icons::{self, Glyph};
 use serde::{Deserialize, Serialize};
 use std::{io, path::PathBuf, sync::Arc};
@@ -49,10 +49,10 @@ pub enum Tool {
 }
 
 impl Tool {
-    pub fn preset_group(self) -> Option<PresetTool> {
+    pub fn favorite_group(self) -> Option<FavoriteTool> {
         match self {
-            Self::Pen => Some(PresetTool::Pen),
-            Self::Highlighter => Some(PresetTool::Highlighter),
+            Self::Pen => Some(FavoriteTool::Pen),
+            Self::Highlighter => Some(FavoriteTool::Highlighter),
             _ => None,
         }
     }
@@ -74,11 +74,11 @@ impl Tool {
     }
 }
 
-impl From<PresetTool> for Tool {
-    fn from(tool: PresetTool) -> Self {
+impl From<FavoriteTool> for Tool {
+    fn from(tool: FavoriteTool) -> Self {
         match tool {
-            PresetTool::Pen => Self::Pen,
-            PresetTool::Highlighter => Self::Highlighter,
+            FavoriteTool::Pen => Self::Pen,
+            FavoriteTool::Highlighter => Self::Highlighter,
         }
     }
 }
@@ -466,16 +466,16 @@ impl Ink {
     }
 
     pub fn complete_contact(&mut self) -> bool {
-        let placed_staff = self.gesture.as_ref().is_some_and(|gesture| {
+        let placed_shape = self.gesture.as_ref().is_some_and(|gesture| {
             matches!(gesture.action, Action::Shape { .. })
-                && matches!(self.marks.last(), Some(Mark::Shape { staff: true, .. }))
+                && matches!(self.marks.last(), Some(Mark::Shape { .. }))
         });
         self.cancel_contact();
-        if placed_staff {
+        if placed_shape {
             self.selected = self.marks.len().checked_sub(1);
             self.damage = Damage::Full;
         }
-        placed_staff
+        placed_shape
     }
 
     pub fn pen(
@@ -1358,6 +1358,25 @@ mod tests {
         ink.cancel_contact();
         assert_eq!(ink.layer_version().append_from(Some(revision)), Some(0));
         assert_eq!(ink.layer_version().count, 1);
+    }
+
+    #[test]
+    fn completing_a_rectangle_selects_it_immediately() {
+        let scratch = data::Scratch::new();
+        let area = RECT {
+            right: 800,
+            bottom: 1200,
+            ..RECT::default()
+        };
+        let settings = Settings::default();
+        let saver = Saver::start(None).unwrap();
+        let mut ink = Ink::default();
+        ink.bind(Some(scratch.0.join("rectangle.json")), &saver).unwrap();
+        let start = POINT { x: 200, y: 300 };
+        assert!(ink.begin(1, area, start, 0.5, Tool::Rectangle, &settings));
+        assert!(ink.complete_contact());
+        assert!(ink.has_selected_shape());
+        assert!(matches!(ink.marks.as_slice(), [Mark::Shape { staff: false, .. }]));
     }
 
     #[test]

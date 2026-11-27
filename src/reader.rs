@@ -1,6 +1,7 @@
 use crate::audio::Sound;
+use crate::data::{ReadingPosition, ScoreEntry};
 use crate::canvas::{self, Canvas};
-use crate::data::{PresetTool, ScoreFile, Settings, Store};
+use crate::data::{Favorites, ScoreFile, Settings, Store};
 use crate::icons::{self, Glyph};
 use crate::ink::{Ink, InkArea, LayerVersion, MOUSE, SAVE_RESULT, SaveStatus, Saver, Tool};
 use crate::overlay::{self, Event, Overlay, Sheet};
@@ -61,6 +62,7 @@ const UTILITIES_TIMER: usize = 5;
 const UTILITIES_IDLE: Duration = Duration::from_millis(5600);
 const PICK_PDF: u32 = WM_APP + 2;
 const OPEN_LIBRARY: u32 = WM_APP + 3;
+const EDIT_TUNING: u32 = WM_APP + 31;
 const OPEN_PREFERENCES: u32 = WM_APP + 4;
 const EXPORT_PDF: u32 = WM_APP + 8;
 const EDIT_BOOKMARK: u32 = WM_APP + 9;
@@ -71,18 +73,16 @@ const DEFAULT_PDF: u32 = WM_APP + 14;
 const SHOW_FEEDBACK: u32 = WM_APP + 15;
 const CHECK_STORE_UPDATE: u32 = WM_APP + 16;
 const STORE_UPDATE_AVAILABLE: u32 = WM_APP + 17;
-const PAGE_ERASE_TIMER: usize = 6;
 const BOOKMARK_DRAG_TIMER: usize = 7;
-const PRESET_SAVED_TIMER: usize = 8;
 const INK_SAVE_TIMER: usize = 9;
 const VIEW_SETTLE_MS: u32 = 130;
 const INK_SAVE_MS: u32 = 180;
-const PAGE_FADE_TIME: Duration = Duration::from_millis(200);
 const ZOOM_TIME: Duration = Duration::from_millis(170);
 const WELCOME_LOGO: &[u8] = include_bytes!("../assets/scoredraw.png");
 
 mod animation;
 mod association;
+mod browse;
 mod tools;
 use animation::{ANIMATION_FRAME, Animation};
 mod chrome;
@@ -113,8 +113,9 @@ fn run_window(files: Vec<PathBuf>) -> Result<()> {
     let state = RefCell::new(Reader {
         welcome_logo: canvas::Bitmap::from_png(WELCOME_LOGO),
         store: Some(store.clone()),
+        recent: store.recent().unwrap_or_default(),
+        favorites: store.favorites().unwrap_or_default(),
         tool: settings.active_tool,
-        favorite: settings.selected_preset(),
         settings,
         ..Reader::default()
     });
@@ -177,14 +178,17 @@ fn run_window(files: Vec<PathBuf>) -> Result<()> {
                 }
             }
         }
+        let launched_with_pdf = !files.is_empty();
+        state.borrow_mut().open(hwnd, files, false);
         let _ = ShowWindow(hwnd, SW_SHOWMAXIMIZED);
         // The launching shell can override the first ShowWindow call.
         if !IsZoomed(hwnd).as_bool() {
             let _ = ShowWindow(hwnd, SW_MAXIMIZE);
         }
-        state.borrow_mut().open(hwnd, files, false);
         post(hwnd, CHECK_STORE_UPDATE);
-        post(hwnd, DEFAULT_PDF);
+        if !launched_with_pdf {
+            post(hwnd, DEFAULT_PDF);
+        }
         let mut _store_check = None;
         let mut message = MSG::default();
         loop {
@@ -208,7 +212,7 @@ fn run_window(files: Vec<PathBuf>) -> Result<()> {
                     match crate::library::show(hwnd, &store) {
                         Ok(Some(files)) => {
                             let mut app = state.borrow_mut();
-                            app.open(hwnd, files, true);
+                            app.open_entries(hwnd, files, true);
                         }
                         Ok(None) => {}
                         Err(error) => {
@@ -224,10 +228,27 @@ fn run_window(files: Vec<PathBuf>) -> Result<()> {
                 _ if message.hwnd == hwnd && message.message == OPEN_PREFERENCES => {
                     let initial = {
                         let app = state.borrow();
-                        app.tool.style(&app.ink_settings()).color
+                        app.tool.style(&app.settings).color
                     };
                     if let Some(color) = crate::preferences::pick(hwnd, initial) {
                         state.borrow_mut().event(hwnd, Event::Color(color));
+                    }
+                }
+                _ if message.hwnd == hwnd && message.message == EDIT_TUNING => {
+                    let initial = state.borrow().settings.tuning_hz.to_string();
+                    if let Ok(Some(value)) = crate::dialog::prompt_text(
+                        hwnd, tr!("Accordatura di riferimento", "Reference tuning"),
+                        tr!("Frequenza del La in Hz (400–480)", "A frequency in Hz (400–480)"),
+                        &initial, tr!("Applica", "Apply"),
+                        |text| text.parse::<u16>().ok().filter(|hz| (400..=480).contains(hz))
+                            .map(|_| ()).ok_or(tr!("Inserisci un valore da 400 a 480.", "Enter a value from 400 to 480.")),
+                    ) && let Ok(tuning_hz) = value.parse() {
+                        let mut app = state.borrow_mut();
+                        let settings = Settings { tuning_hz, ..app.settings };
+                        if app.commit_settings(hwnd, settings) {
+                            app.sound.tick(tuning_hz);
+                            repaint(hwnd);
+                        }
                     }
                 }
                 _ if message.hwnd == hwnd && message.message == EXPORT_PDF => {
@@ -299,6 +320,8 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
 #[derive(Default)]
 struct Reader {
     welcome_logo: Option<canvas::Bitmap>,
+    recent: Vec<ReadingPosition>,
+    browser: browse::Browser,
     session: u64,
     requests: Option<mpsc::Sender<Request>>,
     responses: Option<mpsc::Receiver<Response>>,
@@ -327,15 +350,13 @@ struct Reader {
     radial: Radial,
     overlay: Overlay,
     sound: Sound,
-    favorite: Option<(PresetTool, u8)>,
-    preset_editor: bool,
-    preset_saved: Option<(PresetTool, u8)>,
+    tempo_taps: std::collections::VecDeque<Instant>,
+    favorites: Favorites,
     collapsed_bookmarks: std::collections::HashSet<usize>,
     bookmark_edit: Option<Event>,
     bookmark_drag: Option<POINT>,
     bookmark_scroll_y: Option<i32>,
     bookmark_wheel_delta: i32,
-    page_long_erase: bool,
     resume_page: Option<u32>,
     original_export: bool,
     utilities_activity: Option<Instant>,
@@ -350,16 +371,20 @@ struct Reader {
     animation: Option<Animation>,
     slider_original: Option<Settings>,
     chrome_menu: Option<chrome::Menu>,
+    chrome_visual: Option<chrome::Menu>,
+    overlay_hover: Option<POINT>,
     chrome_hover: Option<chrome::Target>,
     chrome_press: Option<(u32, chrome::Target)>,
     saver: Option<Saver>,
     ink_save_pending: bool,
     close_after_save: bool,
+    close_document_after_save: bool,
     recovered_page: bool,
     paint_buffer: Option<Surface>,
     page_surface: Option<PageSurface>,
     animate_next_turn: bool,
-    page_fade: Option<PageFade>,
+    page_animation: Option<PageAnimation>,
+    page_drag: Option<PageDrag>,
 }
 
 impl Reader {
@@ -379,13 +404,32 @@ impl Reader {
         {
             repaint_rect(hwnd, strip.rect);
         }
+        if msg == WM_MOUSEMOVE {
+            self.browse_hover(hwnd, Some(point_from_mouse(lp)));
+            self.hover_overlays(hwnd, Some(point_from_mouse(lp)));
+        } else if matches!(msg, WM_MOUSELEAVE | WM_NCMOUSEMOVE) {
+            self.browse_hover(hwnd, None);
+            self.hover_overlays(hwnd, None);
+        }
         match msg {
+            WM_COMMAND if self.search_command(hwnd, wp) => {}
+            browse::SEARCH_KEY => self.search_key(hwnd, wp.0),
+            WM_CTLCOLOREDIT if unsafe { GetDlgCtrlID(HWND(lp.0 as _)) } == i32::from(browse::SEARCH_ID) => unsafe {
+                let dc = HDC(wp.0 as _);
+                SetTextColor(dc, TEXT);
+                SetBkColor(dc, SURFACE);
+                SetDCBrushColor(dc, SURFACE);
+                return Some(LRESULT(GetStockObject(DC_BRUSH).0 as isize));
+            },
             WM_PAINT => self.paint(hwnd),
             WM_ERASEBKGND => return Some(LRESULT(1)),
             WM_SIZE => unsafe {
-                self.page_fade = None;
+                self.page_animation = None;
                 self.zoom_animation = None;
                 SetTimer(Some(hwnd), RESIZE_TIMER, VIEW_SETTLE_MS, None);
+                if self.visible.is_some() {
+                    self.animate(hwnd);
+                }
                 repaint(hwnd);
             },
             WM_TIMER if wp.0 == RESIZE_TIMER => {
@@ -406,11 +450,11 @@ impl Reader {
             ANIMATION_FRAME => self.animate_frame(hwnd),
             WM_TIMER if wp.0 == AUDIO_TIMER => {
                 let playing = self.sound.running(0);
-                if self.sound.tick() {
+                if self.sound.tick(self.settings.tuning_hz) {
                     let layout = Layout::new(hwnd, self.fullscreen.is_some());
                     self.repaint_audio(hwnd, &layout);
                     if playing != self.sound.running(0) {
-                        let (bounds, scale) = layout.radial_area();
+                        let (bounds, scale) = self.radial_area(&layout);
                         repaint_rect(hwnd, self.radial.footprint(bounds, scale));
                     }
                 }
@@ -423,13 +467,7 @@ impl Reader {
                 self.toast = None;
                 repaint(hwnd);
             }
-            WM_TIMER if wp.0 == PRESET_SAVED_TIMER => {
-                let _ = unsafe { KillTimer(Some(hwnd), PRESET_SAVED_TIMER) };
-                self.preset_saved = None;
-                repaint(hwnd);
-            }
             WM_TIMER if wp.0 == UTILITIES_TIMER => self.check_utilities_idle(hwnd),
-            WM_TIMER if wp.0 == PAGE_ERASE_TIMER => self.erase_page_hold(hwnd),
             WM_TIMER if wp.0 == BOOKMARK_DRAG_TIMER => self.scroll_dragging_bookmark(hwnd),
             WM_DPICHANGED => unsafe {
                 let rect = &*(lp.0 as *const RECT);
@@ -459,10 +497,13 @@ impl Reader {
                 if self.close_after_save && !matches!(self.save_status(), SaveStatus::Saving) {
                     self.close_after_save = false;
                     post(hwnd, WM_CLOSE);
+                } else if self.close_document_after_save && !matches!(self.save_status(), SaveStatus::Saving) {
+                    self.close_document_after_save = false;
+                    self.close_document(hwnd);
                 }
                 let layout = Layout::new(hwnd, self.fullscreen.is_some());
                 repaint_rect(hwnd, layout.save_notice());
-                let (bounds, scale) = layout.radial_area();
+                let (bounds, scale) = self.radial_area(&layout);
                 repaint_rect(hwnd, self.radial.hub(bounds, scale));
             }
             WM_CLOSE => {
@@ -501,7 +542,9 @@ impl Reader {
                     }
                 }
             }
-            WM_KEYDOWN if self.page_key(hwnd, wp.0) => {}
+            WM_KEYDOWN if wp.0 == 0x46 && unsafe { GetKeyState(VK_CONTROL.0.into()) } < 0
+                && self.focus_browse_search(hwnd) => {}
+            WM_KEYDOWN if self.page_grid_open() && wp.0 != 0x1b => self.grid_key_down(hwnd, wp.0),
             WM_KEYDOWN => match wp.0 {
                 0x25 | 0x21 => self.turn(hwnd, -1),
                 0x27 | 0x22 | 0x20 => self.turn(hwnd, 1),
@@ -523,6 +566,7 @@ impl Reader {
                 0x4f if unsafe { GetKeyState(VK_CONTROL.0.into()) } < 0 => {
                     request_file_picker(hwnd)
                 }
+                0x57 if unsafe { GetKeyState(VK_CONTROL.0.into()) } < 0 => self.close_document(hwnd),
                 0x4c if unsafe { GetKeyState(VK_CONTROL.0.into()) } < 0 => post(hwnd, OPEN_LIBRARY),
                 0x47 if unsafe { GetKeyState(VK_CONTROL.0.into()) } < 0 => {
                     self.open_sheet(hwnd, Sheet::Page)
@@ -540,6 +584,11 @@ impl Reader {
                 0x59 if unsafe { GetKeyState(VK_CONTROL.0.into()) } < 0 => self.redo_ink(hwnd),
                 _ => return None,
             },
+            WM_MOUSEWHEEL if {
+                let mut point = point_from_mouse(lp);
+                let _ = unsafe { ScreenToClient(hwnd, &mut point) };
+                self.browse_wheel(hwnd, point, (wp.0 >> 16) as i16 as i32)
+            } => {}
             WM_MOUSEWHEEL | WM_MOUSEHWHEEL if !self.ink.is_drawing() && self.total > 0 => {
                 let mut point = point_from_mouse(lp);
                 let _ = unsafe { ScreenToClient(hwnd, &mut point) };
@@ -549,7 +598,7 @@ impl Reader {
                     let at = (point.x as f32, point.y as f32);
                     self.transform_view(hwnd, at, at, 1.25_f32.powf(delta as f32 / 120.0));
                 } else if !horizontal
-                    && (self.page_score_wheel(hwnd, delta) || self.bookmark_wheel(hwnd, delta))
+                    && (self.favorite_wheel(hwnd, point, delta) || self.bookmark_wheel(hwnd, delta))
                 {
                 } else if self.overlay.drawer
                     || self.overlay.grab.is_some()
@@ -587,6 +636,11 @@ impl Reader {
             }
             WM_MBUTTONUP if self.mouse_pan.take().is_some() => {
                 let _ = unsafe { ReleaseCapture() };
+            }
+            WM_MOUSEMOVE | WM_LBUTTONUP
+                if self.browse_contact(hwnd, if msg == WM_LBUTTONUP { WM_POINTERUP } else { WM_POINTERUPDATE }, MOUSE, point_from_mouse(lp)) =>
+            {
+                if msg == WM_LBUTTONUP { let _ = unsafe { ReleaseCapture() }; }
             }
             WM_MOUSEMOVE | WM_LBUTTONUP
                 if self.overlay.grab.is_some_and(|grab| grab.id == MOUSE) =>
@@ -633,8 +687,11 @@ impl Reader {
                 self.schedule_ink_save(hwnd);
             }
             WM_CAPTURECHANGED => {
+                self.browse_cancel(MOUSE);
                 self.cancel_chrome_press(MOUSE);
-                self.radial.cancel(MOUSE);
+                if self.radial.cancel(MOUSE) {
+                    repaint(hwnd);
+                }
                 self.cancel_overlay(hwnd, MOUSE);
                 self.mouse_pan = None;
             }
@@ -652,14 +709,19 @@ impl Reader {
             }
             WM_POINTERCAPTURECHANGED => {
                 let id = (wp.0 & 0xffff) as u32;
+                self.browse_cancel(id);
                 self.cancel_chrome_press(id);
                 if self.ink.has_contact(id) {
                     self.ink.cancel_contact();
                     self.schedule_ink_save(hwnd);
                 }
-                self.radial.cancel(id);
+                if self.radial.cancel(id) {
+                    repaint(hwnd);
+                }
                 self.cancel_overlay(hwnd, id);
-                self.touch.cancel(id);
+                if self.touch.cancel(id) {
+                    self.release_page_drag(hwnd);
+                }
             }
             _ => return None,
         }
@@ -667,38 +729,21 @@ impl Reader {
     }
 
     fn open(&mut self, hwnd: HWND, files: Vec<PathBuf>, concert: bool) {
+        self.open_entries(
+            hwnd,
+            files.into_iter().map(ScoreEntry::Whole).collect(),
+            concert,
+        );
+    }
+
+    fn open_entries(&mut self, hwnd: HWND, files: Vec<ScoreEntry>, concert: bool) {
         if files.is_empty() {
             return;
         }
-        self.ink.cancel_contact();
-        if !self.save_ink(hwnd) {
+        self.close_document_after_save = false;
+        if !self.reset_document(hwnd, concert) {
             return;
         }
-        self.session += 1;
-        self.concert = concert;
-        self.total = 0;
-        self.selected = 0;
-        self.view = View::default();
-        self.view_moving = false;
-        self.zoom_animation = None;
-        self.touch = Touch::default();
-        self.wheel = PageWheel::default();
-        self.desired = None;
-        self.visible = None;
-        self.page_fade = None;
-        self.animate_next_turn = false;
-        self.cache.clear();
-        self.queued.clear();
-        self.scores.clear();
-        self.bookmarks = None;
-        self.bookmark_loading = None;
-        self.bookmark_source = None;
-        self.ink = Ink::default();
-        self.recovered_page = false;
-        self.radial.open = false;
-        self.overlay.close();
-        self.hide_utilities(hwnd);
-        self.animate(hwnd);
         self.status = tr!("Apertura degli spartiti…", "Opening scores…").into();
         if let Some(worker) = &self.requests
             && worker.send(Request::Open(self.session, files)).is_err()
@@ -709,10 +754,88 @@ impl Reader {
             )
             .into();
         }
-        if self.fullscreen.is_none() && concert {
-            self.toggle_fullscreen(hwnd);
-        }
         repaint(hwnd);
+    }
+
+    fn reset_document(&mut self, hwnd: HWND, concert: bool) -> bool {
+        self.ink.cancel_contact();
+        if !self.save_ink(hwnd) {
+            return false;
+        }
+        self.session += 1;
+        self.resume_page = None;
+        self.concert = concert;
+        if self.fullscreen.is_none() {
+            unsafe { SetThreadExecutionState(ES_CONTINUOUS) };
+        }
+        self.total = 0;
+        self.selected = 0;
+        self.view = View::default();
+        self.view_moving = false;
+        self.zoom_animation = None;
+        self.touch = Touch::default();
+        self.wheel = PageWheel::default();
+        self.desired = None;
+        self.visible = None;
+        self.page_surface = None;
+        self.page_drag = None;
+        self.page_animation = None;
+        self.animate_next_turn = false;
+        self.cache.clear();
+        self.queued.clear();
+        self.scores.clear();
+        self.bookmarks = None;
+        self.bookmark_loading = None;
+        self.bookmark_source = None;
+        self.ink = Ink::default();
+        self.recovered_page = false;
+        self.radial.open = false;
+        self.overlay.dismiss_drawer();
+        self.chrome_menu = None;
+        self.chrome_visual = None;
+        self.overlay.popup_open = false;
+        self.overlay.popup_opacity = 0.0;
+        self.leave_page_grid();
+        self.hide_utilities(hwnd);
+        self.animate(hwnd);
+        self.status.clear();
+        true
+    }
+
+    fn close_document(&mut self, hwnd: HWND) {
+        if self.total == 0 || self.exporting.is_some() {
+            return;
+        }
+        self.ink.cancel_contact();
+        if !self.save_ink(hwnd) {
+            return;
+        }
+        match self.save_status() {
+            SaveStatus::Saving => {
+                self.close_document_after_save = true;
+                repaint(hwnd);
+                return;
+            }
+            SaveStatus::Failed(error) => {
+                self.show_error(hwnd, &error);
+                return;
+            }
+            SaveStatus::Recovered(paths) => self.show_recovery(hwnd, &paths),
+            SaveStatus::Idle => {}
+        }
+        if self.reset_document(hwnd, false) {
+            if let Some(worker) = &self.requests {
+                let _ = worker.send(Request::Close(self.session));
+            }
+            for slot in 0..2 {
+                self.overlay.dismiss_audio(slot);
+                self.sound.stop(slot);
+            }
+            if self.fullscreen.is_some() {
+                self.toggle_fullscreen(hwnd);
+            }
+            repaint(hwnd);
+        }
     }
 
     fn receive(&mut self, hwnd: HWND) {
@@ -728,6 +851,9 @@ impl Reader {
                         .unwrap_or(0)
                         .min(total.saturating_sub(1));
                     self.status.clear();
+                    if self.concert {
+                        unsafe { SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED) };
+                    }
                     self.reveal_utilities(hwnd);
                     self.refresh(hwnd);
                 }
@@ -739,9 +865,11 @@ impl Reader {
                     self.present(hwnd, key, frame);
                     changed = true;
                 }
+                Response::Thumbnail(key, frame) => changed |= self.thumbnail(key, frame),
                 Response::Rendered(key, frame) if self.queued.contains(&key) => {
                     self.queued.retain(|queued| *queued != key);
                     self.cache.insert(key, frame.clone());
+                    changed |= self.page_drag.as_ref().and_then(|drag| drag.neighbor) == Some(key.index);
                     if self.desired == Some(key) {
                         if self.editable_frame().is_some()
                             && (self.view_moving || self.ink.is_drawing())
@@ -754,14 +882,19 @@ impl Reader {
                     }
                 }
                 Response::OpenError(session, error) if session == self.session => {
-                    self.status =
-                        tr!("Apertura del PDF non riuscita.", "Couldn’t open the PDF.").into();
+                    self.status.clear();
+                    self.resume_page = None;
+                    self.concert = false;
+                    if self.fullscreen.is_some() {
+                        self.toggle_fullscreen(hwnd);
+                    }
                     self.show_error(hwnd, &error);
                     changed = true;
                 }
                 Response::RenderError(key, error) => {
                     self.queued.retain(|queued| *queued != key);
                     if self.desired == Some(key) {
+                        self.release_page_drag(hwnd);
                         if self
                             .visible
                             .as_ref()
@@ -830,19 +963,7 @@ impl Reader {
         {
             self.status = tr!("Caricamento pagina…", "Loading page…").into();
         }
-        let mut neighbors = vec![key];
-        if key.index + 1 < self.total {
-            neighbors.push(PageKey {
-                index: key.index + 1,
-                ..base
-            });
-        }
-        if key.index > 0 {
-            neighbors.push(PageKey {
-                index: key.index - 1,
-                ..base
-            });
-        }
+        let mut neighbors = render_queue::render_plan(key, base, self.total, &self.scores);
         self.cache.retain(|page, _| neighbors.contains(page));
         neighbors.retain(|page| !self.cache.contains_key(page));
         if neighbors != self.queued {
@@ -868,7 +989,7 @@ impl Reader {
 
     fn turn(&mut self, hwnd: HWND, step: i32) {
         let next = self.selected.saturating_add_signed(step);
-        self.go_to(hwnd, next);
+        self.navigate(hwnd, next, true);
     }
 
     fn turn_by_gesture(&mut self, hwnd: HWND, step: i32) {
@@ -888,7 +1009,7 @@ impl Reader {
             }
             self.selected = next;
             self.animate_next_turn = animated && !self.view_moving;
-            self.page_fade = None;
+            self.page_animation = None;
             self.view = View::default();
             self.view_moving = false;
             self.zoom_animation = None;
@@ -909,6 +1030,7 @@ impl Reader {
             if !self.save_ink(hwnd) {
                 return;
             }
+            let drag_start = self.page_drag.take().map_or(0, |drag| drag.dx.abs());
             if std::mem::take(&mut self.animate_next_turn)
                 && let Some((session, index)) = previous
                 && session == key.session
@@ -919,20 +1041,32 @@ impl Reader {
                 })
                 && let Some(page) = self.page_surface.take()
             {
-                self.page_fade = Some(PageFade {
+                self.page_animation = Some(PageAnimation {
                     outgoing: page.composite.unwrap_or(page.raster),
                     clip: page.clip,
                     forward: key.index > index,
+                    distance: drag_start,
+                    viewport: Layout::new(hwnd, self.fullscreen.is_some()).viewport,
                     started: None,
                 });
             }
-            let path = self.store.as_ref().and_then(|store| {
-                self.scores
-                    .iter()
-                    .rev()
-                    .find(|score| score.first_page <= key.index)
-                    .map(|score| store.page_path(&score.source, key.index - score.first_page))
+            let score = self
+                .scores
+                .iter()
+                .rev()
+                .find(|score| score.first_page <= key.index);
+            let path = self.store.as_ref().zip(score).map(|(store, score)| {
+                store.page_path(&score.source, score.pdf_page(key.index))
             });
+            if let Some((store, score)) = self.store.as_ref().zip(score) {
+                let position = ReadingPosition {
+                    path: score.source.path.clone(),
+                    page: score.pdf_page(key.index),
+                };
+                if let Ok(recent) = store.record_reading(&position) {
+                    self.recent = recent;
+                }
+            }
             self.recovered_page = false;
             if let Some(saver) = &self.saver {
                 match self.ink.bind(path, saver) {
@@ -998,7 +1132,6 @@ impl Reader {
 
     fn enter_selection(&mut self, hwnd: HWND) {
         self.tool = Tool::Select;
-        self.favorite = None;
         if self.overlay.drawer && self.overlay.sheet == Some(Sheet::Style) {
             self.close_drawer(hwnd);
         }
@@ -1114,10 +1247,13 @@ impl Reader {
             clock.read();
         }
         let layout = Layout::new(hwnd, self.fullscreen.is_some());
-        let (bounds, scale) = layout.radial_area();
+        let (bounds, scale) = self.radial_area(&layout);
         let old = self.radial.footprint(bounds, scale);
-        let radial = self.radial.tick(bounds, scale);
+        let popup_before = self.overlay.popup_opacity;
         let overlay = self.overlay.tick();
+        if !self.overlay.popup_open && self.overlay.popup_opacity == 0.0 { self.chrome_visual = None; }
+        let obstacles = self.radial_obstacles(&layout);
+        let radial = self.radial.tick(bounds, layout.scale, &obstacles);
         let zooming = self.zoom_animation.is_some();
         if let Some(zoom) = self.zoom_animation {
             let progress = zoom.started.elapsed().as_secs_f32() / ZOOM_TIME.as_secs_f32();
@@ -1133,30 +1269,36 @@ impl Reader {
             self.view_moving = true;
             repaint_rect(hwnd, layout.viewport);
         }
-        let fade_frame = self
-            .page_fade
+        let returning = self.page_drag.as_ref().is_some_and(|drag| drag.released.is_some());
+        if let Some(drag) = &self.page_drag
+            && let Some(start) = drag.released
+        {
+            if start.elapsed() >= PageDrag::RETURN_TIME {
+                self.page_drag = None;
+            }
+            repaint_rect(hwnd, layout.viewport);
+        }
+        let turn_frame = self
+            .page_animation
             .as_ref()
-            .and_then(|fade| fade.started.map(|start| (fade.clip, start)));
-        if let Some((damage, start)) = fade_frame {
-            if start.elapsed() >= PAGE_FADE_TIME {
-                self.page_fade = None;
+            .and_then(|animation| animation.started.map(|start| (animation.viewport, start, animation.duration())));
+        if let Some((damage, start, duration)) = turn_frame {
+            if start.elapsed() >= duration {
+                self.page_animation = None;
             }
             repaint_rect(hwnd, damage);
         }
         if radial {
+            let (bounds, scale) = self.radial_area(&layout);
             let next = self.radial.footprint(bounds, scale);
             repaint_rect(hwnd, union(old, next));
         }
-        if overlay {
-            repaint_rect(
-                hwnd,
-                RECT {
-                    right: (layout.viewport.left + layout.px(392)).min(layout.viewport.right),
-                    ..layout.viewport
-                },
-            );
+        if self.overlay.popup_opacity != popup_before {
+            repaint(hwnd);
+        } else if overlay {
+            repaint_rect(hwnd, layout.viewport);
         }
-        if !radial && !overlay && !zooming && fade_frame.is_none() {
+        if !radial && !overlay && !zooming && !returning && turn_frame.is_none() {
             if let Some(clock) = &self.animation {
                 clock.stop();
             }
@@ -1172,7 +1314,7 @@ impl Reader {
             self.view
                 .transform(fit(frame, viewport), viewport, from, to, factor);
             if self.view != previous {
-                self.page_fade = None;
+                self.page_animation = None;
                 self.view_moving = true;
                 self.defer_view_refresh(hwnd);
                 repaint_rect(hwnd, viewport);
@@ -1193,7 +1335,7 @@ impl Reader {
     fn reset_view(&mut self, hwnd: HWND) {
         self.zoom_animation = None;
         self.view_moving = false;
-        self.page_fade = None;
+        self.page_animation = None;
         self.view = View::default();
         self.refresh(hwnd);
     }
@@ -1222,7 +1364,7 @@ impl Reader {
             center,
             next / self.view.zoom(),
         );
-        self.page_fade = None;
+        self.page_animation = None;
         self.zoom_animation = Some(ZoomAnimation {
             from: self.view,
             target,
@@ -1234,6 +1376,7 @@ impl Reader {
     fn mouse_down(&mut self, hwnd: HWND, point: POINT) {
         if self.chrome_contact(hwnd, WM_POINTERDOWN, MOUSE, point)
             || self.overlay_input(hwnd, WM_POINTERDOWN, MOUSE, point)
+            || self.browse_contact(hwnd, WM_POINTERDOWN, MOUSE, point)
             || self.radial_input(hwnd, WM_POINTERDOWN, MOUSE, point)
         {
             unsafe {
@@ -1241,7 +1384,7 @@ impl Reader {
             }
             return;
         }
-        if self.page_fade.take().is_some() {
+        if self.page_animation.take().is_some() {
             repaint(hwnd);
         }
         self.interrupt_zoom(hwnd);
@@ -1252,7 +1395,7 @@ impl Reader {
         {
             return;
         }
-        let settings = self.ink_settings();
+        let settings = self.settings;
         if inside(layout.viewport, point)
             && let Some(area) = self.page_area(hwnd)
             && self.ink.begin(
@@ -1299,13 +1442,20 @@ impl Reader {
             if unsafe { GetPointerInfo(id, &mut info) }.is_ok() {
                 let mut point = info.ptPixelLocation;
                 let _ = unsafe { ScreenToClient(hwnd, &mut point) };
-                if self.chrome_contact(hwnd, msg, id, point)
+                if (self.radial.grabbed(id) && self.radial_input(hwnd, msg, id, point))
+                    || self.chrome_contact(hwnd, msg, id, point)
                     || self.overlay_input(hwnd, msg, id, point)
-                    || self.radial_input(hwnd, msg, id, point)
+                    || (!self.page_grid_open() && self.radial_input(hwnd, msg, id, point))
                 {
                     return true;
                 }
             }
+        }
+        if matches!(pointer_type, PT_PEN | PT_TOUCH)
+            && let Some(point) = pointer_position(hwnd, id)
+            && self.browse_contact(hwnd, msg, id, point)
+        {
+            return true;
         }
         match pointer_type {
             PT_PEN => {
@@ -1328,7 +1478,7 @@ impl Reader {
                             return false;
                         }
                     }
-                    if self.page_fade.take().is_some() {
+                    if self.page_animation.take().is_some() {
                         repaint(hwnd);
                     }
                 }
@@ -1338,7 +1488,7 @@ impl Reader {
                     msg,
                     id,
                     self.tool,
-                    &self.ink_settings(),
+                    &self.settings,
                 ) {
                     self.touch = Touch::default();
                     if msg == WM_POINTERUP {
@@ -1399,14 +1549,16 @@ impl Reader {
             return false;
         }
         let layout = Layout::new(hwnd, self.fullscreen.is_some());
-        let (bounds, scale) = layout.radial_area();
+        let (bounds, scale) = self.radial_area(&layout);
         let old = self.radial.footprint(bounds, scale);
         match msg {
             WM_POINTERDOWN if !self.ink.is_drawing() => {
                 return self.radial.begin(bounds, scale, id, point);
             }
             WM_POINTERUPDATE if self.radial.grabbed(id) => {
-                self.radial.move_to(bounds, scale, id, point);
+                self.radial.move_to(scale, id, point);
+                self.animate(hwnd);
+                return true;
             }
             WM_POINTERUP if self.radial.grabbed(id) => {
                 let command = self.radial.finish(bounds, scale, id, point);
@@ -1440,7 +1592,7 @@ impl Reader {
             return true;
         }
         if msg == WM_POINTERDOWN {
-            if self.page_fade.take().is_some() {
+            if self.page_drag.take().is_some() || self.page_animation.take().is_some() {
                 repaint(hwnd);
             }
             self.interrupt_zoom(hwnd);
@@ -1470,9 +1622,17 @@ impl Reader {
         };
         match motion {
             Some(Motion::Transform(from, to, factor)) => {
-                self.transform_view(hwnd, from, to, factor)
+                if self.page_drag.take().is_some() { repaint(hwnd); }
+                self.transform_view(hwnd, from, to, factor);
             }
-            Some(Motion::Turn(step)) => self.turn_by_gesture(hwnd, step),
+            Some(Motion::Slide(dx)) => self.slide_with_touch(hwnd, &layout, dx),
+            Some(Motion::Turn(step)) => {
+                let selected = self.selected;
+                self.turn_by_gesture(hwnd, step);
+                if self.selected == selected {
+                    self.release_page_drag(hwnd);
+                }
+            }
             Some(Motion::Tap) => {
                 if matches!(self.tool, Tool::Staff | Tool::Rectangle)
                     && let Some(area) = self.page_area(hwnd)
@@ -1500,9 +1660,70 @@ impl Reader {
                     repaint(hwnd);
                 }
             }
+            None if msg == WM_POINTERUP => self.release_page_drag(hwnd),
             None => {}
         }
         true
+    }
+
+    fn slide_with_touch(&mut self, hwnd: HWND, layout: &Layout, dx: i32) {
+        if self.editable_frame().is_none() { return; }
+        let width = (layout.viewport.right - layout.viewport.left).max(1);
+        let neighbor = if dx < 0 {
+            (self.selected + 1 < self.total).then_some(self.selected + 1)
+        } else {
+            self.selected.checked_sub(1)
+        };
+        let dx = if neighbor.is_some() {
+            dx.clamp(-width, width)
+        } else {
+            (dx / 4).clamp(-width / 8, width / 8)
+        };
+        let drag = self.page_drag.get_or_insert_with(PageDrag::default);
+        if drag.neighbor != neighbor {
+            drag.neighbor = neighbor;
+            drag.ink = Ink::default();
+            drag.preview = None;
+            if let Some(index) = neighbor
+                && let Some(store) = &self.store
+                && let Some(saver) = &self.saver
+                && let Some(score) = self.scores.iter().rev().find(|score| score.first_page <= index)
+            {
+                let _ = drag.ink.bind(Some(store.page_path(&score.source, score.pdf_page(index))), saver);
+            }
+        }
+        drag.dx = dx;
+        drag.released = None;
+        repaint_rect(hwnd, layout.viewport);
+    }
+
+    fn release_page_drag(&mut self, hwnd: HWND) {
+        if let Some(drag) = &mut self.page_drag && drag.released.is_none() {
+            drag.released = Some(Instant::now());
+            self.animate(hwnd);
+            repaint(hwnd);
+        }
+    }
+
+    fn draw_page_drag(&self, dc: HDC, layout: &Layout, clip: RECT, frame: &Frame, drag: &PageDrag) {
+        let dx = drag.offset();
+        let current = offset(fit(frame, layout.viewport), dx, 0);
+        if let Some(page) = &self.page_surface {
+            let source = page.composite.as_ref().unwrap_or(&page.raster);
+            PageAnimation::copy_shifted(dc, source, page.clip, clip, dx);
+            if page.ink_version.is_none() {
+                self.ink.draw_committed(dc, current, clip, 0);
+            }
+        } else {
+            with_clip(dc, clip, || draw_bitmap(dc, current, frame));
+            self.ink.draw_committed(dc, current, clip, 0);
+        }
+        if let Some(preview) = &drag.preview && dx != 0 {
+            let width = layout.viewport.right - layout.viewport.left;
+            PageAnimation::copy_shifted(
+                dc, &preview.surface, preview.bounds, clip, dx - dx.signum() * width,
+            );
+        }
     }
 
     fn touch_move(&mut self, hwnd: HWND, id: u32, point: POINT, scale: f32) -> Option<Motion> {
@@ -1529,14 +1750,7 @@ impl Reader {
 
     fn click(&mut self, hwnd: HWND, point: POINT) {
         let layout = Layout::new(hwnd, self.fullscreen.is_some());
-        if self.total == 0 && self.status.is_empty() && inside(layout.welcome_actions().0, point) {
-            request_file_picker(hwnd);
-        } else if self.total == 0
-            && self.status.is_empty()
-            && inside(layout.welcome_actions().1, point)
-        {
-            post(hwnd, OPEN_LIBRARY);
-        } else if self.settings.tap_turn
+        if self.settings.tap_turn && self.total > 0 && !self.page_grid_open()
             && self.view.zoom() == 1.0
             && inside(layout.viewport, point)
         {
@@ -1554,12 +1768,15 @@ impl Reader {
     }
 
     fn toggle_fullscreen(&mut self, hwnd: HWND) {
+        if self.fullscreen.is_none() && self.total == 0 { return; }
         self.chrome_menu = None;
         self.chrome_hover = None;
         self.chrome_press = None;
         unsafe {
             if let Some(placement) = self.fullscreen.take() {
-                SetThreadExecutionState(ES_CONTINUOUS);
+                if !self.concert || self.total == 0 {
+                    SetThreadExecutionState(ES_CONTINUOUS);
+                }
                 SetWindowLongPtrW(
                     hwnd,
                     GWL_STYLE,
@@ -1621,18 +1838,34 @@ impl Reader {
 
     fn paint(&mut self, hwnd: HWND) {
         let layout = Layout::new(hwnd, self.fullscreen.is_some());
+        if let Some(menu) = self.chrome_menu {
+            self.chrome_visual = Some(menu);
+        }
+        let popup_open = self.chrome_menu.is_some();
+        if popup_open != self.overlay.popup_open {
+            self.overlay.popup_open = popup_open;
+            self.animate(hwnd);
+        }
+        self.sync_search(hwnd, &layout);
+        self.update_thumbnails(hwnd, &layout);
         let mut paint = PAINTSTRUCT::default();
         unsafe {
             let dc = BeginPaint(hwnd, &mut paint);
             if !dc.is_invalid() {
                 self.prepare_page_surface(dc, &layout);
-                if let Some(fade) = &mut self.page_fade
-                    && fade.started.is_none()
+                if let Some(drag) = &mut self.page_drag
+                    && let Some(index) = drag.neighbor
+                    && let Some((_, frame)) = self.cache.iter().find(|(key, _)| key.index == index)
                 {
-                    if fade.prepare(dc, self.page_surface.as_ref()) {
+                    drag.prepare(dc, layout.viewport, frame);
+                }
+                if let Some(animation) = &mut self.page_animation
+                    && animation.started.is_none()
+                {
+                    if animation.prepare(self.page_surface.as_ref()) {
                         self.animate(hwnd);
                     } else {
-                        self.page_fade = None;
+                        self.page_animation = None;
                     }
                 }
                 let (width, height) = (layout.client.right, layout.client.bottom);
@@ -1644,7 +1877,16 @@ impl Reader {
                     self.paint_buffer = Surface::new(dc, width, height);
                 }
                 if let Some(surface) = &self.paint_buffer {
-                    let damage = paint.rcPaint;
+                    // Compose the whole radial menu before copying the invalid area.
+                    let (bounds, scale) = self.radial_area(&layout);
+                    let radial = self.radial.footprint(bounds, scale);
+                    let damage = if (self.visible.is_some() || self.fullscreen.is_some())
+                        && intersect(paint.rcPaint, radial).is_some()
+                    {
+                        union(paint.rcPaint, radial)
+                    } else {
+                        paint.rcPaint
+                    };
                     with_clip(surface.dc, damage, || {
                         self.draw(hwnd, surface.dc, &layout, damage)
                     });
@@ -1675,12 +1917,12 @@ impl Reader {
         };
         let base = fit(frame, layout.viewport);
         let (bounds, clip) = if self.view_moving {
-            // Keep a complete page while zooming or panning so newly exposed edges are available.
-            let full_page = self
-                .page_surface
-                .as_ref()
-                .filter(|page| Arc::ptr_eq(&page.frame, frame) && page.bounds == page.clip)
-                .map_or(base, |page| page.bounds);
+            // Keep all source pixels and newly exposed edges available during the gesture.
+            let full_page = RECT {
+                right: frame.width,
+                bottom: frame.height,
+                ..Default::default()
+            };
             (full_page, full_page)
         } else {
             let bounds = self.view.bounds(base, layout.viewport);
@@ -1722,86 +1964,33 @@ impl Reader {
 
     fn draw(&self, hwnd: HWND, dc: HDC, layout: &Layout, damage: RECT) {
         fill(dc, damage, BACKGROUND);
-        if let Some((_, frame)) = &self.visible {
+        if self.page_grid_open() {
+            self.draw_page_grid(dc, layout);
+        } else if let Some((_, frame)) = &self.visible {
             let bounds = self
                 .view
                 .bounds(fit(frame, layout.viewport), layout.viewport);
             if let Some(clip) = intersect(layout.viewport, damage) {
-                if let Some(page) = &self.page_surface {
-                    page.draw(dc, bounds, clip);
-                } else {
-                    with_clip(dc, clip, || draw_bitmap(dc, bounds, frame));
-                }
-                if self
-                    .page_surface
-                    .as_ref()
-                    .is_none_or(|page| page.ink_version.is_none())
+                if let Some(drag) = &self.page_drag {
+                    self.draw_page_drag(dc, layout, clip, frame, drag);
+                } else if !self.page_animation.as_ref().is_some_and(|animation| {
+                    animation.draw(dc, clip, self.page_surface.as_ref())
+                })
                 {
-                    self.ink.draw_committed(dc, bounds, clip, 0);
-                }
-                if let Some(fade) = &self.page_fade {
-                    fade.draw(dc, clip);
-                } else {
+                    if let Some(page) = &self.page_surface {
+                        page.draw(dc, bounds, clip);
+                    } else {
+                        with_clip(dc, clip, || draw_bitmap(dc, bounds, frame));
+                    }
+                    if self.page_surface.as_ref().is_none_or(|page| page.ink_version.is_none()) {
+                        self.ink.draw_committed(dc, bounds, clip, 0);
+                    }
                     self.ink
                         .draw_live(dc, layout.ink_area(bounds), clip, self.tool);
                 }
             }
         } else {
-            let (open, library) = layout.welcome_actions();
-            let bounds = RECT {
-                left: open.left,
-                right: library.right,
-                ..open
-            };
-            let size = layout.px(76);
-            let left = (layout.client.right + layout.client.left - size) / 2;
-            let top = bounds.top - layout.px(179);
-            let logo_bounds = RECT {
-                left,
-                top,
-                right: left + size,
-                bottom: top + size,
-            };
-            if let Some(logo) = &self.welcome_logo
-                && let Some(clip) = intersect(logo_bounds, damage)
-                && let Some(canvas) = Canvas::new(dc)
-            {
-                canvas.clip(clip);
-                canvas.image(logo, logo_bounds);
-            }
-            let title = RECT {
-                bottom: bounds.top - layout.px(25),
-                top: bounds.top - layout.px(94),
-                ..layout.client
-            };
-            text(dc, title, "ScoreDraw", TEXT, layout.px(46));
-            if self.status.is_empty() {
-                let subtitle = RECT {
-                    bottom: bounds.top - layout.px(18),
-                    top: bounds.top - layout.px(48),
-                    ..layout.client
-                };
-                text(
-                    dc,
-                    subtitle,
-                    tr!(
-                        "Il lettore PDF pensato per i musicisti",
-                        "The PDF reader designed for musicians"
-                    ),
-                    MUTED,
-                    layout.px(16),
-                );
-                button(dc, open, tr!("Apri PDF", "Open PDF"), true, layout.scale);
-                button(
-                    dc,
-                    library,
-                    tr!("Scalette", "Setlists"),
-                    false,
-                    layout.scale,
-                );
-            } else {
-                text(dc, bounds, &self.status, MUTED, layout.px(16));
-            }
+            self.draw_home(dc, layout, damage);
         }
         if let Some(strip) = layout.strip
             && intersect(strip.rect, damage).is_some()
@@ -1821,19 +2010,64 @@ impl Reader {
             );
         }
         let save = self.save_status();
-        let (radial_bounds, scale) = layout.radial_area();
+        if !self.page_grid_open() && !self.radial.dragging() {
+            self.draw_radial(dc, layout, damage, &save);
+        }
+        let notice = match &save {
+            SaveStatus::Failed(_) => tr!("Salvataggio sospeso", "Saving paused"),
+            SaveStatus::Recovered(paths) if paths.len() > 1 => {
+                tr!("Copie di recupero", "Recovery copies")
+            }
+            SaveStatus::Recovered(_) => tr!("Copia di recupero", "Recovery copy"),
+            SaveStatus::Saving if self.fullscreen.is_none() => tr!("Salvataggio…", "Saving…"),
+            _ if self.recovered_page => tr!("Annotazioni recuperate", "Recovered annotations"),
+            _ => "",
+        };
+        let bounds = layout.save_notice();
+        if !notice.is_empty() && intersect(bounds, damage).is_some() {
+            button(dc, bounds, notice, false, layout.scale);
+        }
+        self.draw_overlays(dc, layout, damage);
+        if !self.page_grid_open() && self.radial.dragging() {
+            self.draw_radial(dc, layout, damage, &save);
+        }
+    }
+
+    fn radial_area(&self, layout: &Layout) -> (RECT, f32) {
+        let area = layout.viewport;
+        (area, self.radial.display_scale(area, layout.scale))
+    }
+
+    fn radial_obstacles(&self, layout: &Layout) -> Vec<RECT> {
+        if self.visible.is_none() || self.page_grid_open() {
+            return Vec::new();
+        }
+        let closing_popup = if self.chrome_menu.is_none() {
+            self.chrome_visual.and_then(|menu| self.chrome_card_for(layout, menu))
+        } else {
+            None
+        };
+        self.cards(layout).into_iter().chain(closing_popup)
+            .filter_map(|card| intersect(card.rect, layout.viewport))
+            .collect()
+    }
+
+    fn draw_radial(&self, dc: HDC, layout: &Layout, damage: RECT, save: &SaveStatus) {
+        let (radial_bounds, scale) = self.radial_area(&layout);
         if (self.visible.is_some() || self.fullscreen.is_some())
             && intersect(self.radial.footprint(radial_bounds, scale), damage).is_some()
         {
+            let Some(canvas) = Canvas::new(dc) else { return };
+            canvas.clip(radial_bounds);
+            let disc = |rect, fill, border, width| {
+                canvas.ellipse(rect, canvas::argb(fill, 255), canvas::argb(border, 255), width);
+            };
+            let mut labels = Vec::with_capacity(12);
             let hub = self.radial.hub(radial_bounds, scale);
             for (command, rect) in self.radial.items(radial_bounds, scale) {
-                if intersect(rect, damage).is_none() {
-                    continue;
-                }
                 let selected = command == Command::Tool(self.tool);
                 let tone = radial_tint(command);
-                circle(
-                    dc,
+                disc(
                     rect,
                     blend_color(PANEL, tone, if selected { 28 } else { 9 }),
                     if selected {
@@ -1859,51 +2093,12 @@ impl Reader {
                     top: icon_box.bottom,
                     bottom: center.1 + label_bottom,
                 };
-                icons::draw(dc, command.icon(), icon_box, radius * 0.72, tone);
-                draw_text(
-                    dc,
-                    label_box,
-                    command.label(),
-                    TEXT,
-                    (radius * 0.36).round() as i32,
-                    true,
-                    DT_CENTER,
-                );
-            }
-            for ((tool, slot), rect) in self.radial.presets(radial_bounds, scale) {
-                if intersect(rect, damage).is_none() {
-                    continue;
-                }
-                let inset = ((rect.right - rect.left) as f32 * 0.16).round() as i32;
-                let dot = RECT {
-                    left: rect.left + inset,
-                    right: rect.right - inset,
-                    top: rect.top + inset,
-                    bottom: rect.bottom - inset,
-                };
-                let color = self.settings.preset(tool, slot).color;
-                let active = self.favorite == Some((tool, slot));
-                circle(
-                    dc,
-                    dot,
-                    COLORREF(color),
-                    if active { TEXT } else { MENU_BORDER },
-                    if active { 2.2 } else { 1.0 } * scale,
-                );
-                let brightness =
-                    (color & 255) * 299 + ((color >> 8) & 255) * 587 + ((color >> 16) & 255) * 114;
-                let star = if brightness >= 145_000 {
-                    BACKGROUND
-                } else {
-                    TEXT
-                };
-                icons::draw(dc, Glyph::Star, dot, 11.5 * scale, star);
+                icons::draw_on(&canvas, command.icon(), icon_box, radius * 0.72, tone);
+                labels.push((label_box, command.label(), (radius * 0.36).round() as i32));
             }
             for (_, rect) in self.radial.options(radial_bounds, scale) {
-                if intersect(rect, damage).is_some() {
-                    circle(dc, rect, SURFACE, ACCENT, 1.1 * scale);
-                    text(dc, rect, "⋯", TEXT, (15.0 * scale).round() as i32);
-                }
+                disc(rect, SURFACE, ACCENT, 1.1 * scale);
+                labels.push((rect, "⋯", (15.0 * scale).round() as i32));
             }
             let glyph = if self.radial.open {
                 Glyph::X
@@ -1912,20 +2107,19 @@ impl Reader {
             } else {
                 Command::Tool(self.tool).icon()
             };
-            circle(
-                dc,
+            disc(
                 hub,
                 ACCENT,
-                if matches!(&save, SaveStatus::Failed(_) | SaveStatus::Recovered(_)) {
+                if matches!(save, SaveStatus::Failed(_) | SaveStatus::Recovered(_)) {
                     ALERT
                 } else {
                     ACCENT
                 },
                 scale * 2.0,
             );
-            icons::draw(dc, glyph, hub, 25.0 * scale, BACKGROUND);
+            icons::draw_on(&canvas, glyph, hub, 25.0 * scale, BACKGROUND);
             if !self.radial.open && !self.sound.running(0) {
-                let settings = self.ink_settings();
+                let settings = self.settings;
                 let accent = match self.tool {
                     Tool::Pen => Some(settings.pen.color),
                     Tool::Highlighter => Some(settings.highlighter.color),
@@ -1934,32 +2128,23 @@ impl Reader {
                     _ => None,
                 };
                 if let Some(accent) = accent {
-                    let dot = layout.px(11);
+                    let dot = (11.0 * scale).round() as i32;
                     let rect = RECT {
                         left: hub.right - dot * 2,
                         top: hub.bottom - dot * 2,
                         right: hub.right - dot,
                         bottom: hub.bottom - dot,
                     };
-                    circle(dc, rect, COLORREF(accent), PANEL, layout.scale);
+                    disc(rect, COLORREF(accent), PANEL, scale);
                 }
             }
+            drop(canvas);
+            with_clip(dc, radial_bounds, || {
+                for (bounds, label, size) in labels {
+                    draw_text(dc, bounds, label, TEXT, size, true, DT_CENTER);
+                }
+            });
         }
-        let notice = match save {
-            SaveStatus::Failed(_) => tr!("Salvataggio sospeso", "Saving paused"),
-            SaveStatus::Recovered(paths) if paths.len() > 1 => {
-                tr!("Copie di recupero", "Recovery copies")
-            }
-            SaveStatus::Recovered(_) => tr!("Copia di recupero", "Recovery copy"),
-            SaveStatus::Saving if self.fullscreen.is_none() => tr!("Salvataggio…", "Saving…"),
-            _ if self.recovered_page => tr!("Annotazioni recuperate", "Recovered annotations"),
-            _ => "",
-        };
-        let bounds = layout.save_notice();
-        if !notice.is_empty() && intersect(bounds, damage).is_some() {
-            button(dc, bounds, notice, false, layout.scale);
-        }
-        self.draw_overlays(dc, layout, damage);
     }
 }
 
@@ -1979,103 +2164,108 @@ struct PageSurface {
     ink_version: Option<LayerVersion>,
 }
 
-struct PageFade {
+#[derive(Default)]
+struct PageDrag {
+    dx: i32,
+    neighbor: Option<u32>,
+    ink: Ink,
+    preview: Option<DragPreview>,
+    released: Option<Instant>,
+}
+
+struct DragPreview {
+    frame: Arc<Frame>,
+    bounds: RECT,
+    surface: Surface,
+}
+
+impl PageDrag {
+    const RETURN_TIME: Duration = Duration::from_millis(135);
+
+    fn prepare(&mut self, target: HDC, viewport: RECT, frame: &Arc<Frame>) {
+        let bounds = fit(frame, viewport);
+        if self.preview.as_ref().is_some_and(|cached| {
+            Arc::ptr_eq(&cached.frame, frame) && cached.bounds == bounds
+        }) {
+            return;
+        }
+        let rect = offset(bounds, -bounds.left, -bounds.top);
+        let Some(surface) = Surface::new(target, rect.right, rect.bottom) else { return };
+        draw_bitmap(surface.dc, rect, frame);
+        self.ink.draw_committed(surface.dc, rect, rect, 0);
+        self.preview = Some(DragPreview { frame: frame.clone(), bounds, surface });
+    }
+
+    fn offset(&self) -> i32 {
+        let remaining = self.released.map_or(1.0, |start| {
+            1.0 - (start.elapsed().as_secs_f32() / Self::RETURN_TIME.as_secs_f32()).min(1.0)
+        });
+        (self.dx as f32 * remaining.powi(2)).round() as i32
+    }
+}
+
+struct PageAnimation {
     outgoing: Surface,
     clip: RECT,
     forward: bool,
+    distance: i32,
+    viewport: RECT,
     started: Option<Instant>,
 }
 
-impl PageFade {
-    fn prepare(&mut self, target: HDC, incoming: Option<&PageSurface>) -> bool {
-        let Some(incoming) = incoming else {
-            return false;
-        };
-        // When page sizes differ, blend the background along with the score.
-        let clip = union(self.clip, incoming.clip);
-        if self.clip != clip {
-            let rect = offset(clip, -clip.left, -clip.top);
-            let Some(padded) = Surface::new(target, rect.right, rect.bottom) else {
-                return false;
-            };
-            fill(padded.dc, rect, BACKGROUND);
-            self.outgoing
-                .copy_to(padded.dc, offset(self.clip, -clip.left, -clip.top), 0, 0);
-            self.outgoing = padded;
-            self.clip = clip;
-        }
+impl PageAnimation {
+    fn duration(&self) -> Duration {
+        let width = (self.viewport.right - self.viewport.left).max(1);
+        Duration::from_millis((175 - 120 * i64::from(self.distance.min(width)) / i64::from(width)) as u64)
+    }
+
+    fn prepare(&mut self, incoming: Option<&PageSurface>) -> bool {
+        if incoming.is_none() { return false; }
         self.started = Some(Instant::now());
         true
     }
 
-    fn draw(&self, dc: HDC, damage: RECT) {
+    fn draw(&self, dc: HDC, damage: RECT, incoming: Option<&PageSurface>) -> bool {
         let Some(started) = self.started else {
-            return;
+            return false;
         };
-        let progress = started.elapsed().as_secs_f32() / PAGE_FADE_TIME.as_secs_f32();
+        let progress = started.elapsed().as_secs_f32() / self.duration().as_secs_f32();
         if progress >= 1.0 {
-            return;
+            return false;
         }
-        let width = self.clip.right - self.clip.left;
-        let feather = (width / 2).max(1);
-        let front = ((width + feather) as f32 * progress).round() as i32;
-        let tail = front - feather;
-        let stripe = |start, end| {
-            let (left, right) = if self.forward {
-                (self.clip.right - end, self.clip.right - start)
-            } else {
-                (self.clip.left + start, self.clip.left + end)
-            };
-            intersect(
-                RECT {
-                    left,
-                    right,
-                    ..self.clip
-                },
-                damage,
-            )
-        };
+        let Some(damage) = intersect(self.viewport, damage) else { return false };
+        let width = self.viewport.right - self.viewport.left;
+        let eased = 1.0 - (1.0 - progress).powi(2);
+        let start = self.distance.clamp(0, width);
+        let distance = start + ((width - start) as f32 * eased).round() as i32;
+        let direction = if self.forward { -1 } else { 1 };
+        let edge = if self.forward { self.viewport.right - distance } else { self.viewport.left + distance };
+        let Some(incoming) = incoming else { return false };
+        fill(dc, damage, BACKGROUND);
+        Self::copy_shifted(dc, &self.outgoing, self.clip, damage, distance * direction);
+        let source = incoming.composite.as_ref().unwrap_or(&incoming.raster);
+        Self::copy_shifted(dc, source, incoming.clip, damage, (distance - width) * direction);
+        with_clip(dc, damage, || self.draw_edge(dc, edge, direction, progress));
+        true
+    }
 
-        // Outside the feathered area, only one page is visible.
-        if let Some(rect) = stripe(front, width) {
-            self.outgoing.copy_to(
-                dc,
-                rect,
-                rect.left - self.clip.left,
-                rect.top - self.clip.top,
-            );
+    fn copy_shifted(dc: HDC, source: &Surface, bounds: RECT, damage: RECT, dx: i32) {
+        let shifted = offset(bounds, dx, 0);
+        if let Some(rect) = intersect(shifted, damage) {
+            source.copy_to(dc, rect, rect.left - shifted.left, rect.top - shifted.top);
         }
-        let step = (feather + 63) / 64;
-        let blend_end = front.min(width);
-        let mut start = tail.max(0);
-        while start < blend_end {
-            let end = (start + step).min(blend_end);
-            if let Some(rect) = stripe(start, end) {
-                let position = ((start + end) as f32 * 0.5 - tail as f32) / feather as f32;
-                let opacity = position * position * (3.0 - 2.0 * position);
-                let w = rect.right - rect.left;
-                let h = rect.bottom - rect.top;
-                unsafe {
-                    let _ = AlphaBlend(
-                        dc,
-                        rect.left,
-                        rect.top,
-                        w,
-                        h,
-                        self.outgoing.dc,
-                        rect.left - self.clip.left,
-                        rect.top - self.clip.top,
-                        w,
-                        h,
-                        BLENDFUNCTION {
-                            BlendOp: AC_SRC_OVER as u8,
-                            SourceConstantAlpha: (255.0 * opacity).round() as u8,
-                            ..Default::default()
-                        },
-                    );
-                }
-            }
-            start = end;
+    }
+
+    fn draw_edge(&self, dc: HDC, edge: i32, direction: i32, progress: f32) {
+        let Some(canvas) = Canvas::new(dc) else { return };
+        let top = self.clip.top as f32;
+        let height = (self.clip.bottom - self.clip.top) as f32;
+        let strength = (progress * 10.0).min((1.0 - progress) * 10.0).min(1.0);
+        let side = -direction;
+        for stripe in 0..10 {
+            let x = edge + if side > 0 { stripe } else { -stripe - 1 };
+            let alpha = ((10 - stripe) as f32 * 5.0 * strength) as u8;
+            canvas.rectangle(x as f32, top, 1.0, height, canvas::argb(COLORREF(0), alpha));
         }
     }
 }
@@ -2120,7 +2310,14 @@ impl PageSurface {
 
     fn draw(&self, dc: HDC, bounds: RECT, clip: RECT) {
         let source = self.composite.as_ref().unwrap_or(&self.raster);
-        if self.bounds != bounds {
+        if self.bounds != bounds
+            && self.bounds == self.clip
+            && source.fits(bounds.right - bounds.left, bounds.bottom - bounds.top)
+        {
+            if let Some(to) = intersect(bounds, clip) {
+                source.copy_to(dc, to, to.left - bounds.left, to.top - bounds.top);
+            }
+        } else if self.bounds != bounds {
             with_clip(dc, clip, || source.stretch_to(dc, bounds));
         } else if let Some(to) = intersect(self.clip, clip) {
             source.copy_to(dc, to, to.left - self.clip.left, to.top - self.clip.top);
@@ -2128,8 +2325,8 @@ impl PageSurface {
     }
 }
 
-struct Surface {
-    dc: HDC,
+pub(crate) struct Surface {
+    pub(crate) dc: HDC,
     bitmap: HBITMAP,
     previous: HGDIOBJ,
     width: i32,
@@ -2137,7 +2334,7 @@ struct Surface {
 }
 
 impl Surface {
-    fn new(target: HDC, width: i32, height: i32) -> Option<Self> {
+    pub(crate) fn new(target: HDC, width: i32, height: i32) -> Option<Self> {
         if width <= 0 || height <= 0 {
             return None;
         }
@@ -2171,7 +2368,7 @@ impl Surface {
         self.width == width && self.height == height
     }
 
-    fn copy_to(&self, dc: HDC, to: RECT, x: i32, y: i32) {
+    pub(crate) fn copy_to(&self, dc: HDC, to: RECT, x: i32, y: i32) {
         unsafe {
             let _ = BitBlt(
                 dc,
@@ -2189,7 +2386,8 @@ impl Surface {
 
     fn stretch_to(&self, dc: HDC, to: RECT) {
         unsafe {
-            SetStretchBltMode(dc, COLORONCOLOR);
+            SetStretchBltMode(dc, HALFTONE);
+            let _ = SetBrushOrgEx(dc, 0, 0, None);
             let _ = StretchBlt(
                 dc,
                 to.left,
@@ -2258,14 +2456,6 @@ impl Layout {
         }
     }
 
-    fn radial_area(&self) -> (RECT, f32) {
-        let bounds = RECT {
-            bottom: (self.client.bottom - self.px(67)).max(self.viewport.top),
-            ..self.viewport
-        };
-        (bounds, Radial::fit_scale(bounds, self.scale))
-    }
-
     fn save_notice(&self) -> RECT {
         let left = self.client.left + self.px(15);
         let bottom = self.client.bottom - self.px(14);
@@ -2281,22 +2471,7 @@ impl Layout {
         (dp as f32 * self.scale).round() as i32
     }
 
-    fn welcome_actions(&self) -> (RECT, RECT) {
-        let center = self.client.right / 2;
-        let y = (self.viewport.top + self.viewport.bottom) / 2 + self.px(22);
-        let open = RECT {
-            left: center - self.px(154),
-            top: y,
-            right: center - self.px(5),
-            bottom: y + self.px(49),
-        };
-        let library = RECT {
-            left: center + self.px(5),
-            right: center + self.px(154),
-            ..open
-        };
-        (open, library)
-    }
+
 }
 
 fn viewport_center(viewport: RECT) -> (f32, f32) {
@@ -2407,7 +2582,7 @@ fn pointer_position(hwnd: HWND, id: u32) -> Option<POINT> {
     }
 }
 
-fn draw_bitmap(dc: HDC, rect: RECT, frame: &Frame) {
+pub(crate) fn draw_bitmap(dc: HDC, rect: RECT, frame: &Frame) {
     let info = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
             biSize: size_of::<BITMAPINFOHEADER>() as u32,
@@ -2529,6 +2704,11 @@ fn draw_text(
 
 pub(crate) fn rounded(dc: HDC, rect: RECT, color: COLORREF, round: i32) {
     if rect.right <= rect.left || rect.bottom <= rect.top {
+        return;
+    }
+    if let Some(canvas) = Canvas::new(dc)
+        && canvas.rounded_rectangle(rect, round, canvas::argb(color, 255))
+    {
         return;
     }
     unsafe {
@@ -2772,6 +2952,7 @@ mod tests {
         reader.prepare_page_surface(dc, &layout);
         let preview = reader.page_surface.as_ref().unwrap();
         assert_eq!(preview.bounds, preview.clip);
+        assert!(preview.raster.fits(preview.frame.width, preview.frame.height));
         let preview_bounds = preview.bounds;
         let preview_bitmap = preview.composite.as_ref().unwrap().bitmap;
         for factor in [0.8, 1.1, 1.15, 0.6] {
@@ -2831,8 +3012,9 @@ mod tests {
             let surface = Surface::new(screen, client.right, client.bottom).unwrap();
             reader.draw(HWND::default(), surface.dc, &layout, client);
 
-            let center = client.right / 2;
-            let top = layout.welcome_actions().0.top - layout.px(179);
+            let logo = browse::home_logo(&layout);
+            let center = (logo.left + logo.right) / 2;
+            let top = logo.top;
             let pixel = |y| unsafe { GetPixel(surface.dc, center, top + y) };
             assert_eq!(pixel(0), BACKGROUND);
             assert_eq!(pixel(layout.px(19)), ACCENT);
@@ -2842,6 +3024,140 @@ mod tests {
             }));
         }
         assert_ne!(unsafe { ReleaseDC(None, screen) }, 0);
+    }
+
+    #[test]
+    fn compact_audio_cards_keep_the_primary_control_and_can_expand() {
+        let viewport = RECT {
+            right: 960,
+            bottom: 720,
+            ..RECT::default()
+        };
+        let layout = Layout {
+            client: viewport,
+            viewport,
+            strip: None,
+            scale: 1.0,
+            dpi: 1.0,
+        };
+        let mut reader = Reader::default();
+        for slot in [0, 1] {
+            reader.overlay.toggle_audio(slot);
+            reader.overlay.advance_audio(0.2);
+            let expanded = reader
+                .cards(&layout)
+                .into_iter()
+                .find(|card| card.floating == Some(slot))
+                .unwrap();
+            if slot == 0 {
+                assert!(
+                    expanded.buttons.iter().any(|button| button.event == Event::TapTempo)
+                );
+            }
+            reader.overlay.toggle_compact(slot);
+            reader.overlay.advance_audio(0.09);
+            let midway = reader.cards(&layout).into_iter()
+                .find(|card| card.floating == Some(slot)).unwrap();
+            assert!(midway.rect.bottom - midway.rect.top > 78);
+            assert!(midway.rect.bottom - midway.rect.top < expanded.rect.bottom - expanded.rect.top);
+            assert!(midway.opacity < 1.0);
+            assert!(!midway.interactive);
+            reader.overlay.advance_audio(0.12);
+            let compact = reader
+                .cards(&layout)
+                .into_iter()
+                .find(|card| card.floating == Some(slot))
+                .unwrap();
+            assert!(
+                compact.rect.bottom - compact.rect.top < expanded.rect.bottom - expanded.rect.top
+            );
+            for event in [
+                Event::AudioCompact(slot),
+                Event::AudioToggle(slot),
+                Event::AudioClose(slot),
+            ] {
+                let control = compact.buttons.iter().find(|button| button.event == event).unwrap();
+                let hit = POINT {
+                    x: (control.rect.left + control.rect.right) / 2,
+                    y: (control.rect.top + control.rect.bottom) / 2,
+                };
+                assert_eq!(compact.grab(0, hit).event, Some(event));
+            }
+            reader.overlay.close_audio(slot);
+            assert!(!reader.overlay.audio_visible());
+            reader.overlay.advance_audio(0.2);
+        }
+    }
+
+    #[test]
+    fn concert_controls_jump_to_the_first_playable_page_of_each_neighbor() {
+        let scratch = crate::data::Scratch::new();
+        let path = scratch.0.join("score.pdf");
+        std::fs::write(&path, b"sample").unwrap();
+        let (source, _) = ScoreFile::open(&path).unwrap();
+        let score = |first_page, count, pdf_start| ScoreInfo {
+            title: String::new(),
+            source: source.clone(),
+            first_page,
+            count,
+            pdf_start,
+            pdf_count: 20,
+            entry: ScoreEntry::Whole(path.clone()),
+        };
+        let mut reader = Reader {
+            concert: true,
+            selected: 2,
+            scores: vec![score(0, 4, 6), score(4, 3, 10)],
+            ..Reader::default()
+        };
+        assert_eq!(reader.score_destination(-1), None);
+        assert_eq!(reader.score_destination(1), Some(4));
+        reader.selected = 6;
+        assert_eq!(reader.score_destination(-1), Some(0));
+        assert_eq!(reader.score_destination(1), None);
+    }
+
+    #[test]
+    fn rounded_buttons_and_circles_blend_their_edges() {
+        let _graphics = canvas::Startup::new().unwrap();
+        let screen = unsafe { GetDC(None) };
+        let surface = Surface::new(screen, 90, 50).unwrap();
+        let bounds = RECT { right: 90, bottom: 50, ..RECT::default() };
+        fill(surface.dc, bounds, BACKGROUND);
+        let button = RECT { left: 4, top: 4, right: 43, bottom: 42 };
+        let disc = offset(button, 43, 0);
+        rounded(surface.dc, button, ACCENT, 24);
+        circle(surface.dc, disc, ACCENT, ACCENT, 0.0);
+        for bounds in [button, disc] {
+            assert!((bounds.top..bounds.top + 10).any(|y| {
+                (bounds.left..bounds.left + 15).any(|x| {
+                    let pixel = unsafe { GetPixel(surface.dc, x, y) };
+                    pixel != BACKGROUND && pixel != ACCENT
+                })
+            }));
+        }
+        drop(surface);
+        let _ = unsafe { ReleaseDC(None, screen) };
+    }
+
+    #[test]
+    fn closing_a_document_returns_to_start_and_preserves_history() {
+        let mut reader = Reader {
+            total: 3,
+            selected: 2,
+            recent: vec![ReadingPosition { path: PathBuf::from("score.pdf"), page: 2 }],
+            ..Reader::default()
+        };
+        reader.overlay.open(Sheet::Preferences);
+        reader.overlay.tick();
+        reader.close_document(HWND::default());
+        assert_eq!(reader.total, 0);
+        assert_eq!(reader.selected, 0);
+        assert!(reader.status.is_empty());
+        assert!(!reader.overlay.drawer);
+        assert_eq!(reader.overlay.sheet, None);
+        assert_eq!(reader.recent.len(), 1);
+        assert_eq!(reader.recent[0].page, 2);
     }
 
     #[test]

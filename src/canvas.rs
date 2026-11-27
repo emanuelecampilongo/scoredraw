@@ -83,6 +83,7 @@ impl Canvas {
     }
 
     pub fn ellipse(&self, rect: RECT, fill: u32, outline: u32, width: f32) {
+        unsafe { GdipSetSmoothingMode(self.0, SmoothingModeAntiAlias8x8) };
         let x = rect.left as f32;
         let y = rect.top as f32;
         let w = (rect.right - rect.left) as f32;
@@ -106,6 +107,28 @@ impl Canvas {
                 }
             }
         }
+    }
+
+    pub fn rounded_rectangle(&self, rect: RECT, diameter: i32, color: u32) -> bool {
+        let width = rect.right - rect.left;
+        let height = rect.bottom - rect.top;
+        let diameter = diameter.clamp(0, width.min(height)) as f32;
+        let (left, top, right, bottom) = (rect.left as f32, rect.top as f32, rect.right as f32, rect.bottom as f32);
+        if diameter <= 1.0 {
+            self.rectangle(left, top, width as f32, height as f32, color);
+            return true;
+        }
+        let Some(path) = Path::new() else { return false };
+        unsafe {
+            GdipSetSmoothingMode(self.0, SmoothingModeAntiAlias8x8);
+            GdipAddPathArc(path.0, left, top, diameter, diameter, 180.0, 90.0);
+            GdipAddPathArc(path.0, right - diameter, top, diameter, diameter, 270.0, 90.0);
+            GdipAddPathArc(path.0, right - diameter, bottom - diameter, diameter, diameter, 0.0, 90.0);
+            GdipAddPathArc(path.0, left, bottom - diameter, diameter, diameter, 90.0, 90.0);
+        }
+        path.close();
+        self.fill_path(&path, color);
+        true
     }
 
     pub fn fill_path(&self, path: &Path, color: u32) {

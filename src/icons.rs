@@ -51,9 +51,5 @@ pub fn draw_on(canvas: &Canvas, glyph: Glyph, rect: RECT, size: f32, color: COLO
         }
     }
     let color = canvas::argb(color, 255);
-    if matches!(glyph, Glyph::Star) {
-        canvas.fill_path(&path, color);
-    } else {
-        canvas.stroke_path(&path, color, (size / 12.0).max(1.25));
-    }
+    canvas.stroke_path(&path, color, (size / 12.0).max(1.25));
 }

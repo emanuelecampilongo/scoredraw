@@ -9,11 +9,12 @@ pub enum Glyph {
     Pointer,
     Sliders,
     Shapes,
-    PanelLeft,
     Undo,
     Redo,
     ChevronLeft,
     ChevronRight,
+    SkipBack,
+    SkipForward,
     ChevronUp,
     ChevronDown,
     Plus,
@@ -22,7 +23,6 @@ pub enum Glyph {
     Gauge,
     Metronome,
     Staff,
-    Star,
     Minimize,
     Expand,
     Shrink,
@@ -35,15 +35,36 @@ pub enum Glyph {
     FolderOpen,
     List,
     FileText,
+    PageRange,
     Bookmark,
-    Check,
     Info,
     Copy,
+    Home,
+    Save,
 }
 
 impl Glyph {
     pub(super) fn path(self) -> &'static [Segment] {
         match self {
+            Self::SkipBack => &[
+                Move(5.0, 4.0), Line(5.0, 20.0),
+                Move(19.0, 5.0), Line(9.0, 12.0), Line(19.0, 19.0), Close,
+            ],
+            Self::SkipForward => &[
+                Move(19.0, 4.0), Line(19.0, 20.0),
+                Move(5.0, 5.0), Line(15.0, 12.0), Line(5.0, 19.0), Close,
+            ],
+            Self::Home => &[
+                Move(3.0, 10.0), Line(12.0, 3.0), Line(21.0, 10.0),
+                Line(21.0, 21.0), Line(15.0, 21.0), Line(15.0, 14.0),
+                Line(9.0, 14.0), Line(9.0, 21.0), Line(3.0, 21.0), Close,
+            ],
+            Self::Save => &[
+                Move(4.0, 3.0), Line(16.0, 3.0), Line(21.0, 8.0),
+                Line(21.0, 21.0), Line(3.0, 21.0), Line(3.0, 4.0), Close,
+                Move(7.0, 3.0), Line(7.0, 9.0), Line(16.0, 9.0), Line(16.0, 3.0),
+                Move(7.0, 21.0), Line(7.0, 14.0), Line(17.0, 14.0), Line(17.0, 21.0),
+            ],
             Self::Copy => &[
                 Move(10.0, 8.0),
                 Line(20.0, 8.0),
@@ -167,20 +188,6 @@ impl Glyph {
                 Curve(19.433, 14.0, 21.0, 15.567, 21.0, 17.5),
                 Close,
             ],
-            Self::PanelLeft => &[
-                Move(5.0, 3.0),
-                Line(19.0, 3.0),
-                Curve(20.1046, 3.0, 21.0, 3.8954, 21.0, 5.0),
-                Line(21.0, 19.0),
-                Curve(21.0, 20.1046, 20.1046, 21.0, 19.0, 21.0),
-                Line(5.0, 21.0),
-                Curve(3.8954, 21.0, 3.0, 20.1046, 3.0, 19.0),
-                Line(3.0, 5.0),
-                Curve(3.0, 3.8954, 3.8954, 3.0, 5.0, 3.0),
-                Close,
-                Move(9.0, 3.0),
-                Line(9.0, 21.0),
-            ],
             Self::Undo => &[
                 Move(9.0, 14.0),
                 Line(4.0, 9.0),
@@ -276,6 +283,12 @@ impl Glyph {
                 Move(9.0, 18.0),
                 Line(21.0, 18.0),
             ],
+            Self::PageRange => &[
+                Move(7.0, 4.0), Line(3.0, 4.0), Line(3.0, 20.0), Line(7.0, 20.0),
+                Move(17.0, 4.0), Line(21.0, 4.0), Line(21.0, 20.0), Line(17.0, 20.0),
+                Move(8.0, 12.0), Line(16.0, 12.0),
+                Move(8.0, 9.0), Line(8.0, 15.0), Move(16.0, 9.0), Line(16.0, 15.0),
+            ],
             Self::FileText => &[
                 Move(6.0, 3.0),
                 Line(14.0, 3.0),
@@ -300,7 +313,6 @@ impl Glyph {
                 Line(6.0, 21.0),
                 Close,
             ],
-            Self::Check => &[Move(4.0, 12.0), Line(9.0, 17.0), Line(20.0, 6.0)],
             Self::Info => &[
                 Move(21.0, 12.0),
                 Curve(21.0, 17.0, 17.0, 21.0, 12.0, 21.0),
@@ -312,19 +324,6 @@ impl Glyph {
                 Line(12.0, 16.0),
                 Move(12.0, 7.8),
                 Line(12.0, 8.0),
-            ],
-            Self::Star => &[
-                Move(12.0, 2.0),
-                Line(15.0, 8.1),
-                Line(21.8, 9.1),
-                Line(16.9, 13.8),
-                Line(18.1, 20.6),
-                Line(12.0, 17.4),
-                Line(5.9, 20.6),
-                Line(7.1, 13.8),
-                Line(2.2, 9.1),
-                Line(9.0, 8.1),
-                Close,
             ],
             Self::Expand => &[
                 Move(13.0, 11.0),

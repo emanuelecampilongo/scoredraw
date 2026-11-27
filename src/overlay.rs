@@ -3,11 +3,11 @@ use crate::icons::Glyph;
 use crate::ink::Tool;
 use crate::language::LanguagePreference;
 use crate::radial::Command;
-use crate::render_queue::ScoreInfo;
 use std::time::Instant;
 use windows::Win32::Foundation::{COLORREF, POINT, RECT};
+pub const FAVORITE_ROWS: usize = 3;
+pub const FAVORITE_ROW: i32 = 48;
 pub const BOOKMARK_ROWS: usize = 7;
-pub const PAGE_SCORE_ROWS: usize = 5;
 
 pub const SWATCHES: [u32; 12] = [
     0x392b22, 0xfdfaf7, 0xef9343, 0x5951e1, 0xc990ae, 0xfea39c, 0x88c148, 0x92e7af, 0x51e1ff,
@@ -16,7 +16,6 @@ pub const SWATCHES: [u32; 12] = [
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Sheet {
-    Menu,
     Page,
     Bookmarks,
     Style,
@@ -32,12 +31,6 @@ pub enum Event {
     ResetZoom,
     ToggleTap,
     Language(LanguagePreference),
-    PageDigit(u8),
-    PageErase,
-    PageGo,
-    PageScores,
-    PageScore(usize),
-    PageScoreScroll(i32),
     BookmarkSelect(usize),
     BookmarkScroll(i32),
     BookmarkAdd,
@@ -47,11 +40,15 @@ pub enum Event {
     BookmarkCollapse(usize),
     BookmarkDrag(usize),
     Finalize,
+    CloseDocument,
     DefaultPdf,
     OpenStore,
     DismissStoreUpdate,
     AudioToggle(usize),
     AudioClose(usize),
+    AudioCompact(usize),
+    TapTempo,
+    EditTuning,
     Bpm(i16),
     Beats(i8),
     Color(u32),
@@ -61,10 +58,13 @@ pub enum Event {
     ToggleZoom,
     ZoomStep(i32),
     Turn(i32),
+    ScoreTurn(i32),
     About,
     Feedback,
     DeleteShape,
-    SavePreset(u8),
+    AddFavorite,
+    LoadFavorite(usize),
+    DeleteFavorite(usize),
     CustomColor,
     Website(&'static str),
     Licenses,
@@ -113,31 +113,28 @@ pub struct BookmarkRow<'a> {
 
 pub struct Model<'a> {
     pub fullscreen: bool,
+    pub popup: Option<RECT>,
     pub zoom: f32,
     pub tap: bool,
     pub language: LanguagePreference,
-    pub page: String,
-    pub page_range: String,
-    pub page_target_valid: bool,
-    pub page_can_erase: bool,
-    pub scores: &'a [ScoreInfo],
     pub page_loaded: bool,
     pub page_indicator: String,
     pub undo: bool,
     pub redo: bool,
-    pub can_finalize: bool,
     pub can_turn: [bool; 2],
+    pub concert_navigation: Option<[bool; 2]>,
     pub can_add_bookmark: bool,
     pub bpm: u16,
     pub beats: u8,
+    pub tuning_hz: u16,
+    pub compact_pitch: &'a str,
     pub running: [bool; 2],
     pub audio_status: [&'a str; 2],
     pub pitch: Option<f32>,
     pub pulse: Option<(u8, f32)>,
     pub tool: Tool,
     pub style: Style,
-    pub preset_editor: bool,
-    pub preset_saved: Option<u8>,
+    pub favorites: Option<&'a [Style]>,
     pub bookmarks: &'a [BookmarkRow<'a>],
     pub selected_bookmark: Option<usize>,
     pub bookmark_status: &'a str,
@@ -148,11 +145,6 @@ pub struct Model<'a> {
 pub struct Overlay {
     pub drawer: bool,
     pub sheet: Option<Sheet>,
-    pub page_input: String,
-    pub page_replace: bool,
-    pub page_score: usize,
-    pub page_scores_open: bool,
-    pub page_score_offset: usize,
     pub bookmark_offset: usize,
     pub selected_bookmark: Option<usize>,
     last_frame: Option<Instant>,
@@ -160,13 +152,20 @@ pub struct Overlay {
     floating: [Floating; 2],
     pub grab: Option<Grab>,
     pub utilities: bool,
+    pub utility_opacity: f32,
+    pub popup_opacity: f32,
+    pub popup_open: bool,
     pub zoom_slider: bool,
+    pub favorite_scroll: f32,
 }
 
 #[derive(Default)]
 struct Floating {
     visible: bool,
+    compact: bool,
     anchor: Option<(f32, f32)>,
+    visibility: f32,
+    compactness: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -176,6 +175,7 @@ pub struct Grab {
     pub slider: Option<Slider>,
     pub origin: POINT,
     drag: Option<(usize, POINT, POINT)>,
+    pub favorite_scroll: Option<(f32, f32)>,
 }
 
 impl Grab {
@@ -186,6 +186,7 @@ impl Grab {
             event: None,
             slider: None,
             drag: None,
+            favorite_scroll: None,
         }
     }
 }
@@ -198,6 +199,15 @@ pub struct Card {
     pub buttons: Vec<Button>,
     pub sliders: Vec<Slider>,
     pub separators: Vec<RECT>,
+    pub strokes: Vec<(RECT, Style)>,
+    pub section: Option<RECT>,
+    pub opacity: f32,
+    pub dock: bool,
+    pub drawer: bool,
+    pub interactive: bool,
+    pub favorite_clip: Option<RECT>,
+    pub favorite_labels_start: usize,
+    pub favorite_thumb: Option<RECT>,
     pub scale: f32,
     pub meter: Option<(RECT, Meter)>,
 }
@@ -212,6 +222,7 @@ pub struct Label {
     pub text: String,
     pub size: i32,
     pub muted: bool,
+    pub dark: bool,
 }
 
 pub struct Button {
@@ -227,12 +238,9 @@ pub struct Button {
 impl Overlay {
     pub fn open(&mut self, sheet: Sheet) {
         self.drawer = true;
+        self.favorite_scroll = 0.0;
         self.sheet = Some(sheet);
         self.last_frame = Some(Instant::now());
-        if sheet == Sheet::Page {
-            self.page_input.clear();
-            self.page_scores_open = false;
-        }
     }
 
     pub fn close(&mut self) {
@@ -240,10 +248,32 @@ impl Overlay {
         self.last_frame = Some(Instant::now());
     }
 
+    pub fn dismiss_drawer(&mut self) {
+        self.drawer = false;
+        self.sheet = None;
+        self.grab = None;
+        self.progress = 0.0;
+    }
+
     pub fn toggle_audio(&mut self, slot: usize) -> bool {
         let panel = &mut self.floating[slot];
         panel.visible = !panel.visible;
         panel.visible
+    }
+
+    pub fn toggle_compact(&mut self, slot: usize) {
+        let panel = &mut self.floating[slot];
+        panel.compact = !panel.compact;
+    }
+
+    pub fn close_audio(&mut self, slot: usize) {
+        let panel = &mut self.floating[slot];
+        panel.visible = false;
+    }
+
+    pub fn dismiss_audio(&mut self, slot: usize) {
+        let anchor = self.floating[slot].anchor;
+        self.floating[slot] = Floating { anchor, ..Floating::default() };
     }
 
     pub fn audio_visible(&self) -> bool {
@@ -259,7 +289,32 @@ impl Overlay {
         let old = self.progress;
         let sign = if self.drawer { 1.0 } else { -1.0 };
         self.progress = (self.progress + sign * dt / 0.20).clamp(0.0, 1.0);
-        self.progress != old
+        let previous = self.utility_opacity;
+        let direction = if self.utilities { 1.0 } else { -1.0 };
+        self.utility_opacity = (self.utility_opacity + direction * dt / 0.15).clamp(0.0, 1.0);
+        let popup = self.popup_opacity;
+        let direction = if self.popup_open { 1.0 } else { -1.0 };
+        self.popup_opacity = (self.popup_opacity + direction * dt / 0.12).clamp(0.0, 1.0);
+        let audio = self.advance_audio(dt);
+        self.progress != old || self.utility_opacity != previous || self.popup_opacity != popup || audio
+    }
+
+    pub(crate) fn advance_audio(&mut self, dt: f32) -> bool {
+        let mut changed = false;
+        for panel in &mut self.floating {
+            let previous = (panel.visibility, panel.compactness);
+            let direction = if panel.visible { 1.0 } else { -1.0 };
+            panel.visibility = (panel.visibility + direction * dt / 0.16).clamp(0.0, 1.0);
+            if panel.visible {
+                let direction = if panel.compact { 1.0 } else { -1.0 };
+                panel.compactness = (panel.compactness + direction * dt / 0.19).clamp(0.0, 1.0);
+            } else if panel.visibility == 0.0 {
+                panel.compact = false;
+                panel.compactness = 0.0;
+            }
+            changed |= previous != (panel.visibility, panel.compactness);
+        }
+        changed
     }
 
     pub fn move_to(&mut self, id: u32, at: POINT, viewport: RECT) {
@@ -281,6 +336,14 @@ impl Overlay {
         }
     }
 
+    pub fn drawer_reservation(&self, viewport: RECT, scale: f32) -> i32 {
+        if (!self.drawer && self.progress == 0.0) || self.sheet == Some(Sheet::Page) {
+            return 0;
+        }
+        let width = if self.sheet == Some(Sheet::Bookmarks) { 386.0 } else { 320.0 };
+        (width * scale).round().min((viewport.right - viewport.left) as f32 * 0.64) as i32
+    }
+
     pub fn cards(&self, viewport: RECT, scale: f32, data: &Model<'_>) -> Vec<Card> {
         let mut cards = Vec::new();
         let px = |x: i32| (x as f32 * scale).round() as i32;
@@ -289,38 +352,82 @@ impl Overlay {
         if vw < px(300) || vh < px(160) {
             return cards;
         }
-        if data.page_loaded && self.utilities {
+        if data.page_loaded && (self.utilities || self.utility_opacity > 0.0) {
             self.utilities_panel(viewport, scale, data, &mut cards);
+        }
+        let mut obstacles: Vec<_> = data.popup.into_iter()
+            .chain(cards.iter().map(|card| card.rect)).collect();
+        let drawer = self.drawer_reservation(viewport, scale);
+        if drawer > 0 {
+            obstacles.push(RECT { right: viewport.left + drawer, ..viewport });
         }
         for (slot, panel) in self
             .floating
             .iter()
             .enumerate()
-            .filter(|(_, panel)| panel.visible)
+            .filter(|(_, panel)| panel.visible || panel.visibility > 0.0)
         {
-            let w = px(298);
-            let h = px(if slot == 0 { 310 } else { 223 });
-            let (ax, ay) = panel.anchor.map_or(
-                (
-                    viewport.right - w - px(18),
-                    viewport.top + px(if slot == 0 { 14 } else { 337 }),
-                ),
-                |(x, y)| {
-                    (
-                        viewport.left + (x * vw as f32) as i32,
-                        viewport.top + (y * vh as f32) as i32,
-                    )
-                },
+            let ease = |value: f32| value * value * (3.0 - 2.0 * value);
+            let morph = ease(panel.compactness);
+            let mix = |a: f32, b: f32| (a + (b - a) * morph).round() as i32;
+            let dimensions = (mix(298.0, 254.0), mix(if slot == 0 { 310.0 } else { 263.0 }, 78.0));
+            let mut preferred = panel.anchor.map_or(
+                (viewport.right - px(dimensions.0 + 18),
+                 viewport.top + px(if slot == 0 { 14 } else { 108 })),
+                |(x, y)| (viewport.left + (x * vw as f32) as i32, viewport.top + (y * vh as f32) as i32),
             );
-            let x = ax.clamp(viewport.left, viewport.right - w);
-            let y = ay.clamp(viewport.top, (viewport.bottom - h).max(viewport.top));
-            let mut card = Card::new(x, y, w, h, scale, Some(slot));
+            preferred.1 -= px((8.0 * (1.0 - ease(panel.visibility))).round() as i32);
+            let full = floating_bounds(viewport, &obstacles, preferred, dimensions, scale);
+            let compact = panel.compactness >= 0.5 || full.is_none();
+            let Some((bounds, local_scale)) = full.or_else(|| {
+                floating_bounds(viewport, &obstacles, preferred, (254, 78), scale)
+            }) else {
+                continue;
+            };
+            obstacles.push(bounds);
+            let mut card = Card::new(bounds.left, bounds.top, bounds.right - bounds.left, bounds.bottom - bounds.top, local_scale, Some(slot));
+            card.opacity = ease(panel.visibility) * (0.72 + 0.28 * (2.0 * morph - 1.0).abs());
+            card.interactive = panel.visible && (panel.compactness == 0.0 || panel.compactness == 1.0);
             let title = if slot == 0 {
                 tr!("Metronomo", "Metronome")
             } else {
                 tr!("Accordatore", "Tuner")
             };
-            card.label([14, 4, 222, 38], title, 18, false);
+            let button = match (slot, data.running[slot]) {
+                (_, true) => tr!("Ferma", "Stop"),
+                (0, false) => tr!("Avvia", "Start"),
+                _ => tr!("Avvia microfono", "Start microphone"),
+            };
+            if compact {
+                let label = if slot == 0 {
+                    format!("{} BPM", data.bpm)
+                } else if data.compact_pitch.is_empty() {
+                    title.into()
+                } else {
+                    data.compact_pitch.into()
+                };
+                card.label([9, 4, 161, 38], label, 17, false);
+                card.icon([174, 7, 34, 30], Glyph::Expand, Event::AudioCompact(slot), true);
+                card.icon([210, 7, 34, 30], Glyph::X, Event::AudioClose(slot), true);
+                if slot == 0 {
+                    card.button([10, 42, 75, 27], button, Event::AudioToggle(slot), !data.running[slot]);
+                    card.meter = Some((card.rect([91, 42, 151, 27]), Meter::Pulse {
+                        beats: data.beats, flash: data.pulse,
+                    }));
+                } else {
+                    let compact_button = if data.running[slot] { button } else { tr!("Avvia", "Start") };
+                    card.button([10, 42, 75, 27], compact_button, Event::AudioToggle(slot), !data.running[slot]);
+                    if data.compact_pitch.is_empty() {
+                        card.label([91, 42, 151, 27], data.audio_status[slot], 12, true);
+                    } else {
+                        card.label([91, 42, 151, 27], trf!("La4 = {} Hz", "A4 = {} Hz", data.tuning_hz), 12, true);
+                    }
+                }
+                cards.push(card);
+                continue;
+            }
+            card.label([14, 4, 194, 38], title, 18, false);
+            card.icon([216, 7, 34, 30], Glyph::Minus, Event::AudioCompact(slot), true);
             card.icon([253, 7, 34, 30], Glyph::X, Event::AudioClose(slot), true);
             if slot == 0 {
                 card.button([13, 51, 34, 34], "−", Event::Bpm(-1), false);
@@ -357,20 +464,17 @@ impl Overlay {
                     229,
                 )
             } else {
-                (
-                    (card.rect([18, 44, 261, 85]), Meter::Pitch(data.pitch)),
-                    132,
-                )
+                card.label([48, 48, 202, 32], trf!("La4 = {} Hz", "A4 = {} Hz", data.tuning_hz), 16, false);
+                card.icon([251, 48, 34, 32], Glyph::Pencil, Event::EditTuning, true);
+                ((card.rect([18, 84, 261, 85]), Meter::Pitch(data.pitch)), 172)
             };
             card.meter = Some(meter);
             card.label([13, label_y, 272, 36], data.audio_status[slot], 13, true);
-            let button = match (slot, data.running[slot]) {
-                (_, true) => tr!("Ferma", "Stop"),
-                (0, false) => tr!("Avvia", "Start"),
-                _ => tr!("Avvia microfono", "Start microphone"),
-            };
+            if slot == 0 {
+                card.button([152, label_y + 37, 133, 32], tr!("Tap Tempo", "Tap Tempo"), Event::TapTempo, false);
+            }
             card.button(
-                [13, label_y + 37, 272, 32],
+                [13, label_y + 37, if slot == 0 { 133 } else { 272 }, 32],
                 button,
                 Event::AudioToggle(slot),
                 !data.running[slot],
@@ -380,20 +484,13 @@ impl Overlay {
         if self.progress == 0.0 {
             return cards;
         }
-        let sheet = self.sheet.unwrap_or(Sheet::Menu);
+        let Some(sheet) = self.sheet else { return cards };
         let height_dp = match sheet {
-            Sheet::Menu => 451,
-            Sheet::Page => {
-                if data.scores.len() > 1 {
-                    395
-                } else {
-                    345
-                }
-            }
+            Sheet::Page => return cards,
             Sheet::Bookmarks => 508,
             Sheet::Style => {
-                if data.preset_editor {
-                    400
+                if let Some(favorites) = data.favorites {
+                    favorite_bottom(favorites.len()) + 12
                 } else if data.tool == Tool::Rectangle {
                     254
                 } else {
@@ -406,16 +503,16 @@ impl Overlay {
         let width_dp = if sheet == Sheet::Bookmarks { 386 } else { 320 };
         let scale = scale
             .min(vh as f32 / height_dp as f32)
-            .min(vw as f32 / width_dp as f32);
+            .min(vw as f32 * 0.64 / width_dp as f32);
         let width = (width_dp as f32 * scale).round() as i32;
         let position = 1.0 - (1.0 - self.progress).powi(3);
         let x = viewport.left + ((position - 1.0) * width as f32).round() as i32;
         let height = (height_dp as f32 * scale).round() as i32;
         let mut card = Card::new(x, viewport.top, width, height, scale, None);
+        card.drawer = true;
         let style_title;
         let title = match sheet {
-            Sheet::Menu => "ScoreDraw",
-            Sheet::Page => tr!("Vai a pagina", "Go to page"),
+            Sheet::Page => unreachable!(),
             Sheet::Bookmarks => tr!("Segnalibri", "Bookmarks"),
             Sheet::Style => {
                 style_title = trf!(
@@ -429,14 +526,6 @@ impl Overlay {
             Sheet::About => "ScoreDraw",
         };
         card.label([52, 6, 203, 36], title, 20, false);
-        if sheet != Sheet::Menu {
-            card.icon(
-                [12, 9, 36, 32],
-                Glyph::ChevronLeft,
-                Event::Sheet(Sheet::Menu),
-                true,
-            );
-        }
         card.icon(
             [width_dp - 46, 9, 34, 32],
             Glyph::X,
@@ -444,10 +533,9 @@ impl Overlay {
             true,
         );
         match sheet {
-            Sheet::Menu => card.menu(data),
-            Sheet::Page => card.pages(self, data),
+            Sheet::Page => unreachable!(),
             Sheet::Bookmarks => card.bookmarks(data),
-            Sheet::Style => card.style(data),
+            Sheet::Style => card.style(self, data),
             Sheet::Preferences => card.preferences(data),
             Sheet::About => card.about(),
         }
@@ -456,7 +544,7 @@ impl Overlay {
     }
 
     fn utilities_panel(&self, viewport: RECT, scale: f32, data: &Model<'_>, cards: &mut Vec<Card>) {
-        let width = if data.fullscreen { 558 } else { 506 };
+        let width = if data.concert_navigation.is_some() { 606 } else { 506 };
         let scale = scale.min((viewport.right - viewport.left) as f32 / (width + 18) as f32);
         let px = |x: i32| (x as f32 * scale).round() as i32;
         let middle = (viewport.left + viewport.right) / 2;
@@ -469,6 +557,8 @@ impl Overlay {
             scale,
             None,
         );
+        dock.dock = true;
+        dock.opacity = self.utility_opacity;
         dock.icon(
             [6, 6, 41, 41],
             Glyph::Undo,
@@ -520,8 +610,13 @@ impl Overlay {
             data.zoom < 4.0,
         );
         dock.separator(442);
+        if let Some([previous, next]) = data.concert_navigation {
+            dock.icon([451, 6, 43, 41], Glyph::SkipBack, Event::ScoreTurn(-1), previous);
+            dock.icon([497, 6, 43, 41], Glyph::SkipForward, Event::ScoreTurn(1), next);
+            dock.separator(546);
+        }
         dock.icon(
-            [452, 6, 46, 41],
+            [width - 54, 6, 46, 41],
             if data.fullscreen {
                 Glyph::Shrink
             } else {
@@ -530,14 +625,6 @@ impl Overlay {
             Event::Command(Command::Fullscreen),
             true,
         );
-        if data.fullscreen {
-            dock.icon(
-                [504, 6, 46, 41],
-                Glyph::PanelLeft,
-                Event::Command(Command::Panel),
-                true,
-            );
-        }
         cards.push(dock);
         if self.zoom_slider {
             let mut zoom = Card::new(
@@ -548,6 +635,8 @@ impl Overlay {
                 scale,
                 None,
             );
+            zoom.dock = true;
+            zoom.opacity = self.utility_opacity;
             zoom.icon(
                 [7, 11, 37, 43],
                 Glyph::Minimize,
@@ -610,6 +699,15 @@ impl Card {
             buttons: Vec::new(),
             sliders: Vec::new(),
             separators: Vec::new(),
+            strokes: Vec::new(),
+            section: None,
+            opacity: 1.0,
+            dock: false,
+            drawer: false,
+            interactive: true,
+            favorite_clip: None,
+            favorite_labels_start: usize::MAX,
+            favorite_thumb: None,
             meter: None,
             scale,
         }
@@ -624,7 +722,10 @@ impl Card {
             .buttons
             .iter()
             .rev()
-            .find(|b| b.enabled && contains(b.rect, at))
+            .find(|b| {
+                b.enabled && contains(b.rect, at)
+                    && (!b.event.is_favorite_row() || self.favorite_clip.is_some_and(|clip| contains(clip, at)))
+            })
             .map(|b| b.event);
         let slider = self.sliders.iter().copied().find(|s| contains(s.rect, at));
         let drag = self
@@ -646,6 +747,7 @@ impl Card {
             event,
             drag,
             slider,
+            favorite_scroll: None,
         }
     }
 
@@ -667,6 +769,7 @@ impl Card {
                 text: text.into(),
                 size,
                 muted,
+                dark: false,
             });
         }
     }
@@ -728,172 +831,6 @@ impl Card {
         if let Some(button) = self.buttons.get_mut(i) {
             button.enabled = enabled;
         }
-    }
-
-    fn menu(&mut self, data: &Model<'_>) {
-        use Command as C;
-        use Event as E;
-        self.pair(
-            55,
-            (tr!("Apri PDF", "Open PDF"), E::Command(C::Open)),
-            (tr!("Scalette", "Setlists"), E::Command(C::Library)),
-        );
-        if data.page_loaded {
-            self.pair(
-                102,
-                (tr!("Vai a pagina", "Go to page"), E::Sheet(Sheet::Page)),
-                (tr!("Segnalibri", "Bookmarks"), E::Sheet(Sheet::Bookmarks)),
-            );
-        }
-        self.pair(
-            149,
-            (tr!("Metronomo", "Metronome"), E::Command(C::Metronome)),
-            (tr!("Accordatore", "Tuner"), E::Command(C::Tuner)),
-        );
-        if data.page_loaded {
-            self.action(
-                [12, 196, 144, 39],
-                tr!("Annulla", "Cancel"),
-                E::Command(C::Undo),
-                false,
-                data.undo,
-            );
-            self.action(
-                [164, 196, 144, 39],
-                tr!("Ripeti", "Redo"),
-                E::Command(C::Redo),
-                false,
-                data.redo,
-            );
-            self.action(
-                [12, 243, 296, 39],
-                tr!("Rendi modifiche permanenti…", "Make changes permanent…"),
-                E::Finalize,
-                false,
-                data.can_finalize,
-            );
-        }
-        self.button(
-            [12, 290, 144, 39],
-            if data.fullscreen {
-                tr!("Torna in finestra", "Exit full screen")
-            } else {
-                tr!("Schermo intero", "Full screen")
-            },
-            E::Command(C::Fullscreen),
-            false,
-        );
-        self.action(
-            [164, 290, 144, 39],
-            tr!("Adatta pagina", "Fit page"),
-            E::ResetZoom,
-            false,
-            data.zoom > 1.0,
-        );
-        self.button(
-            [12, 337, 296, 39],
-            tr!("Preferenze", "Settings"),
-            E::Advanced,
-            false,
-        );
-        self.label(
-            [12, 379, 296, 28],
-            format!("Zoom {}%", (data.zoom * 100.0).round()),
-            13,
-            true,
-        );
-        self.button(
-            [12, 404, 296, 36],
-            tr!("Informazioni", "About"),
-            E::About,
-            false,
-        );
-    }
-
-    fn pages(&mut self, state: &Overlay, data: &Model<'_>) {
-        let mut offset = 0;
-        if data.scores.len() > 1 {
-            let selected = data
-                .scores
-                .get(state.page_score)
-                .map_or(tr!("Scegli spartito", "Choose score"), |score| {
-                    score.title.as_str()
-                });
-            self.menu_item(
-                [20, 49, 280, 42],
-                selected,
-                if state.page_scores_open {
-                    Glyph::ChevronUp
-                } else {
-                    Glyph::ChevronDown
-                },
-                Event::PageScores,
-                true,
-            );
-            if state.page_scores_open {
-                for (row, (index, score)) in data
-                    .scores
-                    .iter()
-                    .enumerate()
-                    .skip(state.page_score_offset)
-                    .take(PAGE_SCORE_ROWS)
-                    .enumerate()
-                {
-                    self.button(
-                        [20, 99 + row as i32 * 47, 280, 42],
-                        format!("{}. {}", index + 1, score.title),
-                        Event::PageScore(index),
-                        state.page_score == index,
-                    );
-                }
-                let more = state.page_score_offset + PAGE_SCORE_ROWS < data.scores.len();
-                if more || state.page_score_offset > 0 {
-                    self.icon(
-                        [19, 339, 134, 42],
-                        Glyph::ChevronUp,
-                        Event::PageScoreScroll(-1),
-                        state.page_score_offset > 0,
-                    );
-                    self.icon(
-                        [167, 339, 134, 42],
-                        Glyph::ChevronDown,
-                        Event::PageScoreScroll(1),
-                        more,
-                    );
-                }
-                return;
-            }
-            offset = 50;
-        }
-        self.label([12, 50 + offset, 296, 33], &data.page, 25, false);
-        self.label([12, 81 + offset, 296, 23], &data.page_range, 13, true);
-        for (i, digit) in [1, 2, 3, 4, 5, 6, 7, 8, 9, 0].into_iter().enumerate() {
-            self.button(
-                [
-                    20 + (i % 3) as i32 * 96,
-                    111 + offset + (i / 3) as i32 * 54,
-                    88,
-                    46,
-                ],
-                digit.to_string(),
-                Event::PageDigit(digit),
-                false,
-            );
-        }
-        self.action(
-            [116, 273 + offset, 88, 46],
-            "⌫",
-            Event::PageErase,
-            false,
-            data.page_can_erase,
-        );
-        self.action(
-            [212, 273 + offset, 88, 46],
-            tr!("Vai", "Go"),
-            Event::PageGo,
-            true,
-            data.page_target_valid,
-        );
     }
 
     fn bookmarks(&mut self, data: &Model<'_>) {
@@ -1006,6 +943,7 @@ impl Card {
                 data.language == preference,
             );
         }
+
     }
 
     fn about(&mut self) {
@@ -1049,7 +987,7 @@ impl Card {
         );
     }
 
-    fn style(&mut self, data: &Model<'_>) {
+    fn style(&mut self, state: &Overlay, data: &Model<'_>) {
         for (i, color) in SWATCHES.into_iter().enumerate() {
             let len = self.buttons.len();
             self.button(
@@ -1131,28 +1069,67 @@ impl Card {
             [16, y + 75, 288, 33],
             tr!("Colore personalizzato…", "Custom color…"),
             Event::CustomColor,
-            true,
+            false,
         );
-        if data.preset_editor {
-            self.label(
-                [12, 328, 296, 25],
-                tr!("Salva come preferito", "Save as favorite"),
-                13,
-                true,
+        if let Some(favorites) = data.favorites {
+            let bottom = favorite_bottom(favorites.len());
+            self.section = Some(self.rect([12, 345, 296, bottom - 345]));
+            self.label([20, 352, 90, 32], tr!("Preferiti", "Favorites"), 16, false);
+            self.button(
+                [113, 352, 185, 32],
+                tr!("Aggiungi ai preferiti", "Add to favorites"),
+                Event::AddFavorite,
+                false,
             );
-            for slot in 0..3 {
-                self.button(
-                    [17 + i32::from(slot) * 96, 354, 89, 39],
-                    if data.preset_saved == Some(slot) {
-                        tr!("✓ Salvato", "✓ Saved").into()
-                    } else {
-                        format!("Slot {}", slot + 1)
-                    },
-                    Event::SavePreset(slot),
-                    false,
+            if favorites.is_empty() {
+                self.label([23, 393, 274, 32], tr!("Nessun preferito", "No favorites yet"), 13, true);
+                return;
+            }
+            let height = favorites.len().min(FAVORITE_ROWS) as i32 * FAVORITE_ROW;
+            let scroll = state.favorite_scroll.clamp(0.0, favorite_max_scroll(favorites.len()));
+            let clip = self.rect([18, 393, 286, height]);
+            self.favorite_clip = Some(clip);
+            self.favorite_labels_start = self.labels.len();
+            let start = scroll as usize / FAVORITE_ROW as usize;
+            for (index, &style) in favorites.iter().enumerate().skip(start).take(FAVORITE_ROWS + 1) {
+                let y = 393 + index as i32 * FAVORITE_ROW - scroll.round() as i32;
+                if y >= 393 + height { break; }
+                self.button([22, y, 234, 42], "", Event::LoadFavorite(index), style == data.style);
+                self.icon([260, y, 38, 42], Glyph::Trash, Event::DeleteFavorite(index), true);
+                self.strokes.push((self.rect([32, y + 8, 58, 26]), style));
+                self.label([93, y + 2, 160, 18], trf!("Preferito {}", "Favorite {}", index + 1), 13, false);
+                self.label(
+                    [92, y + 20, 162, 17],
+                    trf!("Spess. {:.1}‰ · Opacità {:.0}%", "Width {:.1}‰ · Opacity {:.0}%",
+                        style.width * 1000.0, f32::from(style.opacity) * 100.0 / 255.0),
+                    11,
+                    style != data.style,
                 );
+                if style == data.style {
+                    for label in self.labels.iter_mut().rev().take(2) { label.dark = true; }
+                }
+            }
+            if favorites.len() > FAVORITE_ROWS {
+                let fraction = FAVORITE_ROWS as f32 / favorites.len() as f32;
+                let size = (height as f32 * fraction).round().max(12.0) as i32;
+                let y = 393 + ((height - size) as f32 * scroll / favorite_max_scroll(favorites.len())).round() as i32;
+                self.favorite_thumb = Some(self.rect([300, y, 3, size]));
             }
         }
+    }
+}
+
+fn favorite_bottom(count: usize) -> i32 {
+    393 + count.clamp(1, FAVORITE_ROWS) as i32 * FAVORITE_ROW
+}
+
+pub fn favorite_max_scroll(count: usize) -> f32 {
+    count.saturating_sub(FAVORITE_ROWS) as f32 * FAVORITE_ROW as f32
+}
+
+impl Event {
+    pub fn is_favorite_row(self) -> bool {
+        matches!(self, Self::LoadFavorite(_) | Self::DeleteFavorite(_))
     }
 }
 
@@ -1164,6 +1141,59 @@ pub fn width_from_ratio(ratio: f32) -> f32 {
     (5.0 + 595.0 * ratio.powi(2)).round() / 10_000.0
 }
 
+fn floating_bounds(
+    area: RECT,
+    obstacles: &[RECT],
+    preferred: (i32, i32),
+    (width, height): (i32, i32),
+    scale: f32,
+) -> Option<(RECT, f32)> {
+    let gap = (7.0 * scale).round() as i32;
+    for percent in [100, 90, 80, 70, 60, 50, 40, 30] {
+        let scale = scale * percent as f32 / 100.0;
+        let w = (width as f32 * scale).round() as i32;
+        let h = (height as f32 * scale).round() as i32;
+        let max_x = area.right - w;
+        let max_y = area.bottom - h;
+        if max_x < area.left || max_y < area.top { continue; }
+        let mut xs = vec![area.left, max_x, preferred.0.clamp(area.left, max_x)];
+        let mut ys = vec![area.top, max_y, preferred.1.clamp(area.top, max_y)];
+        for obstacle in obstacles {
+            xs.extend([obstacle.left - w - gap, obstacle.right + gap]);
+            ys.extend([obstacle.top - h - gap, obstacle.bottom + gap]);
+        }
+        if let Some(rect) = xs.iter().flat_map(|&x| ys.iter().map(move |&y| (x, y)))
+            .filter(|&(x, y)| (area.left..=max_x).contains(&x) && (area.top..=max_y).contains(&y))
+            .map(|(left, top)| RECT { left, top, right: left + w, bottom: top + h })
+            .filter(|r| obstacles.iter().all(|o| r.right <= o.left || r.left >= o.right || r.bottom <= o.top || r.top >= o.bottom))
+            .min_by_key(|r| i64::from(r.left - preferred.0).pow(2) + i64::from(r.top - preferred.1).pow(2))
+        {
+            return Some((rect, scale));
+        }
+    }
+    None
+}
+
 pub fn contains(rect: RECT, at: POINT) -> bool {
     at.x >= rect.left && at.x < rect.right && at.y >= rect.top && at.y < rect.bottom
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_floating_card_moves_clear_of_the_radial_and_other_panels() {
+        let area = RECT { left: 0, top: 0, right: 420, bottom: 520 };
+        let drawer = RECT { right: 220, ..area };
+        let radial = RECT { left: 290, top: 340, right: 410, bottom: 470 };
+        let (first, _) = floating_bounds(area, &[drawer, radial], (280, 330), (254, 78), 1.0).unwrap();
+        let (second, _) = floating_bounds(area, &[drawer, radial, first], (280, 330), (254, 78), 1.0).unwrap();
+        let separate = |a: RECT, b: RECT| {
+            a.left >= b.right || a.right <= b.left || a.top >= b.bottom || a.bottom <= b.top
+        };
+        for obstacle in [drawer, radial, first] {
+            assert!(separate(second, obstacle));
+        }
+    }
 }

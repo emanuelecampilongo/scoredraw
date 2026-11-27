@@ -20,6 +20,19 @@ pub(super) struct Browser {
     previews: HashMap<PageKey, Option<Arc<Frame>>>,
     preview_order: VecDeque<PageKey>,
     requested: Vec<PageKey>,
+    cells: RefCell<VecDeque<(GridCell, Surface)>>,
+    loading_since: Option<Instant>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct GridCell {
+    key: PageKey,
+    width: i32,
+    height: i32,
+    scale: f32,
+    selected: bool,
+    hovered: bool,
+    ready: bool,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -100,7 +113,7 @@ impl Grid {
         let v = layout.viewport;
         let px = |value| layout.px(value);
         let close = rect(v.right - px(50), v.top + px(11), px(40), px(40));
-        let search = rect(close.left - px(151), v.top + px(14), px(140), px(33));
+        let search = rect(close.left - px(255), v.top + px(14), px(190), px(33));
         let list = RECT {
             left: v.left + px(14), right: v.right - px(16),
             top: v.top + px(if multi { 152 } else { 103 }), bottom: v.bottom - px(6),
@@ -200,6 +213,7 @@ impl Reader {
         self.leave_page_grid();
         self.browser.previews.clear();
         self.browser.preview_order.clear();
+        self.browser.cells.get_mut().clear();
     }
 
     fn search_text(&self, mode: Mode) -> &str {
@@ -233,7 +247,7 @@ impl Reader {
             if changed {
                 let cue = HSTRING::from(match mode {
                     Mode::Home => tr!("Cerca nei recenti", "Search recent PDFs"),
-                    Mode::Pages => tr!("Numero di pagina", "Page number"),
+                    Mode::Pages => tr!("Cerca una pagina", "Find a page"),
                 });
                 SendMessageW(edit, EM_SETCUEBANNER, Some(WPARAM(0)), Some(LPARAM(cue.as_ptr() as isize)));
                 let _ = SetWindowTextW(edit, &HSTRING::from(self.search_text(mode)));
@@ -241,9 +255,9 @@ impl Reader {
             if !changed && self.browser.edit_rect == bounds { return; }
             self.browser.edit_rect = bounds;
             let height = layout.px(18).max(17).min(bounds.bottom - bounds.top);
-            let inset = layout.px(8);
-            let _ = SetWindowPos(edit, None, bounds.left + inset, (bounds.top + bounds.bottom - height) / 2,
-                (bounds.right - bounds.left - 2 * inset).max(1), height, SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            let left = layout.px(if mode == Mode::Pages { 33 } else { 8 });
+            let _ = SetWindowPos(edit, None, bounds.left + left, (bounds.top + bounds.bottom - height) / 2,
+                (bounds.right - bounds.left - left - layout.px(8)).max(1), height, SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
         }
     }
 
@@ -394,7 +408,7 @@ impl Reader {
         self.request_thumbnails(pages.map(|index| self.grid_key(index)).collect());
     }
 
-    pub(super) fn update_thumbnails(&mut self, _hwnd: HWND, layout: &Layout) {
+    pub(super) fn update_thumbnails(&mut self, hwnd: HWND, layout: &Layout) {
         if !self.page_grid_open() { return; }
         let grid = Grid::new(layout, self.scores.len() > 1);
         let (first, count) = self.grid_pages().unwrap_or_default();
@@ -411,6 +425,30 @@ impl Reader {
             .map(|index| self.grid_key(first + index as u32))
             .collect();
         self.request_thumbnails(pages);
+        if !self.browser.requested.is_empty() && self.browser.loading_since.is_none() {
+            self.browser.loading_since = Some(Instant::now());
+            unsafe { SetTimer(Some(hwnd), GRID_LOADING_TIMER, 85, None) };
+        }
+    }
+
+    pub(super) fn tick_grid_loading(&mut self, hwnd: HWND) {
+        if !self.page_grid_open() || self.browser.requested.is_empty() {
+            self.browser.loading_since = None;
+            let _ = unsafe { KillTimer(Some(hwnd), GRID_LOADING_TIMER) };
+            return;
+        }
+        let layout = Layout::new(hwnd, self.fullscreen.is_some());
+        let grid = Grid::new(&layout, self.scores.len() > 1);
+        let (first, count) = self.grid_pages().unwrap_or_default();
+        let scroll = self.grid_scroll(grid, count);
+        for index in grid.visible(count, scroll) {
+            let key = self.grid_key(first + index as u32);
+            if self.browser.requested.contains(&key)
+                && let Some(rect) = intersect(grid.list, loading_bounds(grid.card(index, scroll, &layout), &layout))
+            {
+                repaint_rect(hwnd, rect);
+            }
+        }
     }
 
     fn request_thumbnails(&mut self, mut missing: Vec<PageKey>) {
@@ -428,6 +466,7 @@ impl Reader {
         self.browser.requested.retain(|requested| *requested != key);
         self.browser.preview_order.push_back(key);
         self.browser.previews.insert(key, frame);
+        self.browser.cells.get_mut().retain(|(cell, _)| cell.key != key);
         if self.browser.preview_order.len() > 96
             && let Some(oldest) = self.browser.preview_order.pop_front()
         {
@@ -479,17 +518,16 @@ impl Reader {
         let layout = Layout::new(hwnd, self.fullscreen.is_some());
         match self.browse_mode() {
             Some(Mode::Home) if inside(Home::new(&layout).list, point) => {
-                self.browser.home_scroll = self.home_scroll(Home::new(&layout)).saturating_sub(delta);
-                self.browser.home_scroll = self.home_scroll(Home::new(&layout));
+                let scroll = self.home_scroll(Home::new(&layout)).saturating_sub(delta);
+                self.scroll_browse(hwnd, Mode::Home, &layout, scroll);
             }
             Some(Mode::Pages) if inside(layout.viewport, point) => {
                 let grid = Grid::new(&layout, self.scores.len() > 1);
-                self.browser.page_scroll = self.grid_scroll(grid, self.grid_pages().map_or(0, |(_, count)| count)).saturating_sub(delta);
-                self.update_thumbnails(hwnd, &layout);
+                let scroll = self.grid_scroll(grid, self.grid_pages().map_or(0, |(_, count)| count)).saturating_sub(delta);
+                self.scroll_browse(hwnd, Mode::Pages, &layout, scroll);
             }
             _ => return false,
         }
-        repaint(hwnd);
         true
     }
 
@@ -552,14 +590,16 @@ impl Reader {
     }
 
     fn scroll_browse(&mut self, hwnd: HWND, mode: Mode, layout: &Layout, scroll: i32) {
-        if mode == Mode::Home {
+        let list = if mode == Mode::Home {
             self.browser.home_scroll = scroll;
             self.browser.home_scroll = self.home_scroll(Home::new(layout));
+            Home::new(layout).list
         } else {
             self.browser.page_scroll = scroll;
             self.update_thumbnails(hwnd, layout);
-        }
-        repaint_rect(hwnd, layout.viewport);
+            Grid::new(layout, self.scores.len() > 1).list
+        };
+        repaint_rect(hwnd, RECT { right: list.right + layout.px(14), ..list });
     }
 
     pub(super) fn browse_hover(&mut self, hwnd: HWND, point: Option<POINT>) {
@@ -656,6 +696,8 @@ impl Reader {
             text_left(dc, RECT { left: v.left + px(15), right: grid.search.left - px(5), top: v.top + px(6), bottom: v.top + px(54) },
                 tr!("Vai a pagina", "Go to page"), TEXT, px(23));
             rounded(dc, grid.search, SURFACE, px(14));
+            icons::draw(dc, Glyph::Search, RECT { right: grid.search.left + px(31), ..grid.search },
+                px(17) as f32, MUTED);
             icon_button(dc, grid.close, Glyph::X, true, layout.scale);
             text(dc, RECT { top: v.top + px(56), bottom: v.top + px(89), ..grid.list },
                 &score.title, MUTED, px(15));
@@ -693,23 +735,89 @@ impl Reader {
                 let cell = grid.cell(index, scroll);
                 if intersect(cell, damage).is_none() { continue; }
                 let card = grid.card(index, scroll, layout);
-                let selected = self.selected == global;
-                let hovered = self.browser.hover.is_some_and(|point| inside(card, point));
-                rounded(dc, card, if selected { ACCENT } else if hovered { SURFACE } else { PANEL }, px(15));
-                let preview = RECT { left: card.left + px(11), right: card.right - px(11),
-                    top: card.top + px(10), bottom: card.bottom - px(31) };
-                if let Some(Some(frame)) = self.browser.previews.get(&self.grid_key(global)) {
-                    draw_bitmap(dc, fit(frame, preview), frame);
-                } else {
-                    icons::draw(dc, Glyph::FileText, preview, px(27) as f32, if selected { BACKGROUND } else { MUTED });
+                let key = self.grid_key(global);
+                let frame = self.browser.previews.get(&key).and_then(Option::as_deref);
+                let style = GridCell {
+                    key,
+                    width: card.right - card.left,
+                    height: card.bottom - card.top,
+                    scale: layout.scale,
+                    selected: self.selected == global,
+                    hovered: self.browser.hover.is_some_and(|point| inside(card, point)),
+                    ready: frame.is_some(),
+                };
+                self.browser.paint_cell(dc, layout, card, style, frame, score.pdf_page(global) + 1);
+                if frame.is_none() {
+                    let area = loading_bounds(card, layout);
+                    if intersect(area, damage).is_some() {
+                        let color = if style.selected { BACKGROUND } else { MUTED };
+                        if self.browser.requested.contains(&key) && let Some(start) = self.browser.loading_since {
+                            draw_grid_loading(dc, area, color, start.elapsed());
+                        } else {
+                            icons::draw(dc, Glyph::FileText, area, px(22) as f32, color);
+                        }
+                    }
                 }
-                text(dc, RECT { top: preview.bottom, ..card }, &(score.pdf_page(global) + 1).to_string(),
-                    if selected { BACKGROUND } else { TEXT }, px(15));
             }
         });
         if let Some(bar) = scroll_bar(grid.list, (count.div_ceil(grid.cols) as i32).saturating_mul(grid.cell_height), scroll, layout) {
             draw_scrollbar(dc, bar, layout.scale);
         }
+    }
+}
+
+impl Browser {
+    fn paint_cell(&self, dc: HDC, layout: &Layout, card: RECT, style: GridCell, frame: Option<&Frame>, page: u32) {
+        let px = |value| layout.px(value);
+        let draw = |dc, card: RECT| {
+            fill(dc, card, BACKGROUND);
+            rounded(dc, card, if style.selected { ACCENT } else if style.hovered { SURFACE } else { PANEL }, px(15));
+            let preview = RECT { left: card.left + px(11), right: card.right - px(11),
+                top: card.top + px(10), bottom: card.bottom - px(31) };
+            if let Some(frame) = frame {
+                draw_bitmap(dc, fit(frame, preview), frame);
+            }
+            text(dc, RECT { top: preview.bottom, ..card }, &page.to_string(),
+                if style.selected { BACKGROUND } else { TEXT }, px(15));
+        };
+        let mut cells = self.cells.borrow_mut();
+        let surface = if let Some(index) = cells.iter().position(|(key, _)| *key == style) {
+            cells.remove(index).unwrap().1
+        } else if let Some(surface) = Surface::new(dc, style.width, style.height) {
+            draw(surface.dc, rect(0, 0, style.width, style.height));
+            surface
+        } else {
+            draw(dc, card);
+            return;
+        };
+        surface.copy_to(dc, card, 0, 0);
+        cells.push_back((style, surface));
+        if cells.len() > 64 {
+            cells.pop_front();
+        }
+    }
+}
+
+fn loading_bounds(card: RECT, layout: &Layout) -> RECT {
+    let radius = layout.px(15);
+    let x = (card.left + card.right) / 2;
+    let y = (card.top + card.bottom - layout.px(21)) / 2;
+    rect(x - radius, y - radius, 2 * radius, 2 * radius)
+}
+
+fn draw_grid_loading(dc: HDC, area: RECT, color: COLORREF, elapsed: Duration) {
+    let Some(canvas) = Canvas::new(dc) else { return };
+    let radius = (area.right - area.left) as f32 * 0.34;
+    let x = (area.left + area.right) as f32 / 2.0;
+    let y = (area.top + area.bottom) as f32 / 2.0;
+    let step = elapsed.as_millis() / 85 % 8;
+    for dot in 0..8 {
+        let angle = dot as f32 * std::f32::consts::TAU / 8.0;
+        let alpha = 32 + ((dot + 8 - step) % 8) as u8 * 23;
+        let cx = (x + radius * angle.cos()).round() as i32;
+        let cy = (y + radius * angle.sin()).round() as i32;
+        let size = (radius * 0.22).round().max(1.0) as i32;
+        canvas.ellipse(rect(cx - size, cy - size, size * 2, size * 2), canvas::argb(color, alpha), 0, 0.0);
     }
 }
 
@@ -759,6 +867,24 @@ mod tests {
         assert!((bar.scroll(y, grab) - 450.0).abs() < 3.0);
         assert_eq!(bar.scroll(track.top - 10, grab), 0.0);
         assert_eq!(bar.scroll(track.bottom + 10, grab), 900.0);
+    }
+
+    #[test]
+    fn grid_scroll_reuses_a_composed_thumbnail_cell() {
+        let _drawing = canvas::Startup::new().unwrap();
+        let screen = unsafe { GetDC(None) };
+        let area = rect(0, 0, 320, 400);
+        let target = Surface::new(screen, 320, 400).unwrap();
+        unsafe { ReleaseDC(None, screen); }
+        let layout = Layout { client: area, viewport: area, strip: None, scale: 1.0, dpi: 1.0 };
+        let style = GridCell { key: PageKey { session: 1, index: 0, width: 16, height: 16 },
+            width: 170, height: 210, scale: 1.0, selected: false, hovered: false, ready: true };
+        let frame = Frame { width: 16, height: 16, pixels: vec![255; 16 * 16 * 4] };
+        let browser = Browser::default();
+        browser.paint_cell(target.dc, &layout, rect(6, 100, 170, 210), style, Some(&frame), 1);
+        let first = browser.cells.borrow().front().unwrap().1.id;
+        browser.paint_cell(target.dc, &layout, rect(6, 88, 170, 210), style, Some(&frame), 1);
+        assert_eq!(browser.cells.borrow().front().unwrap().1.id, first);
     }
 
     #[test]

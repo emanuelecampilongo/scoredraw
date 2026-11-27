@@ -30,11 +30,12 @@ pub struct Bookmark {
     retargeted: bool,
 }
 
-#[derive(Clone, Copy)]
-pub enum DropPosition {
-    Before,
-    Child,
-    After,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BookmarkPosition {
+    First,
+    Last,
+    After(usize),
+    Child(usize),
 }
 
 impl Bookmarks {
@@ -74,15 +75,22 @@ impl Bookmarks {
         Ok(bookmarks)
     }
 
-    pub fn add(&mut self, title: String, page: u32) -> usize {
-        self.entries.push(Bookmark {
-            title,
-            page: Some(page),
-            depth: 0,
-            id: None,
-            retargeted: true,
-        });
-        self.entries.len() - 1
+    pub fn insert(&mut self, position: BookmarkPosition, title: String, page: u32) -> Option<usize> {
+        let (index, depth) = match position {
+            BookmarkPosition::First => (0, 0),
+            BookmarkPosition::Last => (self.entries.len(), 0),
+            BookmarkPosition::After(selected) => {
+                let depth = self.entries.get(selected)?.depth;
+                (self.subtree_end(selected), depth)
+            },
+            BookmarkPosition::Child(selected) => {
+                let depth = self.entries.get(selected)?.depth + 1;
+                if depth >= 128 { return None; }
+                (self.subtree_end(selected), depth)
+            }
+        };
+        self.entries.insert(index, Bookmark { title, page: Some(page), depth, id: None, retargeted: true });
+        Some(index)
     }
 
     pub fn retarget(&mut self, index: usize, page: u32) {
@@ -98,60 +106,6 @@ impl Bookmarks {
             child.depth -= 1;
         }
         self.entries.remove(index);
-    }
-
-    pub fn move_branch(&mut self, from: usize, to: usize, position: DropPosition) -> Option<usize> {
-        let depth = self.entries.get(from)?.depth;
-        let target_depth = self.entries.get(to)?.depth;
-        let end = self.subtree_end(from);
-        if (from..end).contains(&to) {
-            return None;
-        }
-        let (insert, new_depth) = match position {
-            DropPosition::Before => (to, target_depth),
-            DropPosition::Child => (self.subtree_end(to), target_depth + 1),
-            DropPosition::After => (self.subtree_end(to), target_depth),
-        };
-        if self.entries[from..end]
-            .iter()
-            .any(|entry| new_depth + entry.depth - depth >= 128)
-        {
-            return None;
-        }
-        let branch: Vec<_> = self
-            .entries
-            .drain(from..end)
-            .map(|mut entry| {
-                entry.depth = new_depth + entry.depth - depth;
-                entry
-            })
-            .collect();
-        let insert = if insert >= end {
-            insert - (end - from)
-        } else {
-            insert
-        };
-        self.entries.splice(insert..insert, branch);
-        Some(insert)
-    }
-
-    pub fn add_child(&mut self, parent: usize, title: String, page: u32) -> Option<usize> {
-        let depth = self.entries.get(parent)?.depth + 1;
-        if depth >= 128 {
-            return None;
-        }
-        let index = self.subtree_end(parent);
-        self.entries.insert(
-            index,
-            Bookmark {
-                title,
-                page: Some(page),
-                depth,
-                id: None,
-                retargeted: true,
-            },
-        );
-        Some(index)
     }
 
     #[cfg(test)]
@@ -658,31 +612,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn moving_a_branch_preserves_depth_and_rejects_descendant_drops() {
+    fn bookmark_insertion_preserves_the_selected_subtree_and_depth() {
+        use BookmarkPosition as Position;
         let mut bookmarks = Bookmarks::default();
-        let first = bookmarks.add("Atto I".into(), 1);
-        let child = bookmarks.add_child(first, "Scena I".into(), 2).unwrap();
-        let second = bookmarks.add("Atto II".into(), 3);
-        assert!(
-            bookmarks
-                .move_branch(first, child, DropPosition::Child)
-                .is_none()
-        );
-        assert_eq!(
-            bookmarks.move_branch(first, second, DropPosition::Child),
-            Some(1)
-        );
-        assert_eq!(
-            bookmarks
-                .entries
-                .iter()
-                .map(|b| b.depth)
-                .collect::<Vec<_>>(),
-            [0, 1, 2]
-        );
-        bookmarks.remove(1);
-        assert_eq!(bookmarks.entries[1].title, "Scena I");
-        assert_eq!(bookmarks.entries[1].depth, 1);
+        assert_eq!(bookmarks.insert(Position::After(0), "Invalid".into(), 1), None);
+        bookmarks.insert(Position::Last, "Act I".into(), 1);
+        bookmarks.insert(Position::Child(0), "Scene I".into(), 2);
+        bookmarks.insert(Position::Child(1), "Song".into(), 3);
+        assert_eq!(bookmarks.insert(Position::After(1), "Scene II".into(), 4), Some(3));
+        bookmarks.insert(Position::First, "Prelude".into(), 1);
+        bookmarks.insert(Position::Last, "Finale".into(), 5);
+        let actual: Vec<_> = bookmarks.entries.iter().map(|entry| (entry.title.as_str(), entry.depth)).collect();
+        assert_eq!(actual, [("Prelude", 0), ("Act I", 0), ("Scene I", 1), ("Song", 2), ("Scene II", 1), ("Finale", 0)]);
+        bookmarks.remove(2);
+        assert_eq!(bookmarks.entries[2].depth, 1);
     }
 
     #[test]
@@ -708,10 +651,10 @@ mod tests {
             .add_object(dictionary! { "Type" => "Catalog", "Pages" => Object::Reference(parents) });
         original.trailer.set("Root", Object::Reference(catalog));
         let mut bookmarks = Bookmarks::default();
-        bookmarks.add("Primo movimento".into(), 1);
-        bookmarks.add("Épisode · ♫".into(), 1);
+        bookmarks.insert(BookmarkPosition::Last, "Primo movimento".into(), 1);
+        bookmarks.insert(BookmarkPosition::Last, "Épisode · ♫".into(), 1);
         bookmarks.entries[1].depth = 1;
-        bookmarks.add("Finale".into(), 1);
+        bookmarks.insert(BookmarkPosition::Last, "Finale".into(), 1);
         bookmarks.write_pdf(&mut original).unwrap();
         original.save(&source).unwrap();
         let (source, _) = ScoreFile::open(&source).unwrap();

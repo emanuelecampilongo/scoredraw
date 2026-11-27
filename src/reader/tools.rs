@@ -38,7 +38,9 @@ impl Reader {
             Command::Tool(tool) => {
                 self.select_tool(hwnd, tool);
                 if self.overlay.drawer && self.overlay.sheet == Some(Sheet::Style) {
-                    if !tool.has_options() {
+                    if tool.has_options() {
+                        self.drawer_tool = Some(tool);
+                    } else {
                         self.close_drawer(hwnd);
                     }
                 }
@@ -79,9 +81,20 @@ impl Reader {
         if self.total == 0 && matches!(sheet, Sheet::Page | Sheet::Bookmarks) {
             return;
         }
-        self.hide_utilities(hwnd);
         self.chrome_menu = None;
-        if self.page_grid_open() { self.leave_page_grid(); }
+        if self.page_grid_open() && sheet != Sheet::Page {
+            self.leave_page_grid();
+            self.overlay.dismiss_drawer();
+        } else if self.overlay.sheet != Some(sheet) && !self.overlay.drawer_closed() {
+            self.pending_drawer = Some(sheet);
+            self.overlay.close();
+            self.animate(hwnd);
+            return;
+        }
+        self.pending_drawer = None;
+        self.bookmark_add_menu = false;
+        self.drawer_tool = (sheet == Sheet::Style).then_some(self.tool);
+        if sheet == Sheet::Page { self.hide_utilities(hwnd); }
         self.overlay.open(sheet);
         if sheet == Sheet::Page { self.start_page_grid(hwnd); }
         if sheet == Sheet::Bookmarks {
@@ -92,6 +105,8 @@ impl Reader {
     }
 
     pub(super) fn close_drawer(&mut self, hwnd: HWND) {
+        self.pending_drawer = None;
+        self.bookmark_add_menu = false;
         if self.page_grid_open() { self.leave_page_grid(); }
         self.overlay.close();
         self.reveal_utilities(hwnd);
@@ -102,9 +117,7 @@ impl Reader {
     pub(super) fn cancel_overlay(&mut self, hwnd: HWND, id: u32) {
         if self.overlay.grab.is_some_and(|grab| grab.id == id) {
             self.overlay.grab = None;
-            self.bookmark_drag = None;
             self.bookmark_scroll_y = None;
-            let _ = unsafe { KillTimer(Some(hwnd), BOOKMARK_DRAG_TIMER) };
             self.finish_slider(hwnd);
         }
     }
@@ -121,7 +134,7 @@ impl Reader {
     }
 
     pub(super) fn reveal_utilities(&mut self, hwnd: HWND) {
-        if self.total == 0 || self.overlay.drawer {
+        if self.total == 0 || self.page_grid_open() {
             return;
         }
         self.utilities_activity = Some(Instant::now());
@@ -158,8 +171,8 @@ impl Reader {
         repaint_rect(
             hwnd,
             RECT {
-                left: (middle - layout.px(314)).max(layout.viewport.left),
-                right: (middle + layout.px(314)).min(layout.viewport.right),
+                left: (middle - layout.px(336)).max(layout.viewport.left),
+                right: (middle + layout.px(336)).min(layout.viewport.right),
                 top: (layout.viewport.bottom - layout.px(141)).max(layout.viewport.top),
                 bottom: layout.viewport.bottom,
             },
@@ -206,9 +219,6 @@ impl Reader {
                     grab = overlay::Grab::dismiss(id, at);
                 }
                 self.overlay.grab = Some(grab);
-                if matches!(grab.event, Some(Event::BookmarkDrag(_))) {
-                    unsafe { SetTimer(Some(hwnd), BOOKMARK_DRAG_TIMER, 170, None) };
-                }
                 if let Some(slider) = grab.slider {
                     self.slider_original =
                         (slider.kind != SliderKind::Zoom).then_some(self.settings);
@@ -227,7 +237,6 @@ impl Reader {
                         self.bookmark_scroll_y = Some(at.y);
                     }
                     match grab.event {
-                        Some(Event::BookmarkDrag(_)) => self.bookmark_drag = Some(at),
                         Some(Event::BookmarkSelect(_))
                             if dy.abs() > layout.px(24) || self.bookmark_scroll_y.is_some() =>
                         {
@@ -251,15 +260,11 @@ impl Reader {
                 }
             }
             WM_POINTERUP if self.overlay.grab.is_some_and(|grab| grab.id == id) => {
-                    let _ = unsafe { KillTimer(Some(hwnd), BOOKMARK_DRAG_TIMER) };
                 let grab = self.overlay.grab.take();
                 let swiped = self.bookmark_scroll_y.take().is_some();
-                self.bookmark_drag = None;
                 if let Some(slider) = grab.and_then(|grab| grab.slider) {
                     self.preview_slider(hwnd, slider, at.x);
                     self.finish_slider(hwnd);
-                } else if let Some(Event::BookmarkDrag(index)) = grab.and_then(|grab| grab.event) {
-                    self.drop_bookmark(hwnd, &layout, index, at);
                 } else if !swiped
                     && let Some(event) = grab.and_then(|grab| grab.event)
                     && self
@@ -289,7 +294,7 @@ impl Reader {
         let page_indicator = self.current_score().map_or_else(String::new, |s| {
             format!("{} / {}", s.pdf_page(self.selected) + 1, s.pdf_count)
         });
-        let indices = if self.overlay.drawer && self.overlay.sheet == Some(Sheet::Bookmarks) {
+        let indices = if !self.overlay.drawer_closed() && self.overlay.sheet == Some(Sheet::Bookmarks) {
             self.visible_bookmarks()
         } else {
             Vec::new()
@@ -309,7 +314,7 @@ impl Reader {
                             title: &entry.title,
                             detail: entry
                                 .page
-                                .map_or_else(String::new, |page| format!("· {page}")),
+                                .map_or_else(String::new, |page| page.to_string()),
                             index,
                             depth: entry.depth,
                             branch: bookmarks
@@ -323,6 +328,7 @@ impl Reader {
             })
             .unwrap_or_default();
         let chrome = self.chrome_card(layout);
+        let drawer_tool = self.drawer_tool.unwrap_or(self.tool);
         let mut cards = self.overlay.cards(
             layout.viewport,
             layout.scale,
@@ -349,16 +355,16 @@ impl Reader {
                 audio_status: [self.sound.status(0), self.sound.status(1)],
                 pitch: self.sound.pitch,
                 pulse: self.sound.pulse(),
-                tool: self.tool,
-                style: self.tool.style(&self.settings),
-                favorites: self.tool.favorite_group().map(|tool| self.favorites.styles(tool)),
+                tool: drawer_tool,
+                style: drawer_tool.style(&self.settings),
+                favorites: drawer_tool.favorite_group().map(|tool| self.favorites.styles(tool)),
                 bookmarks: &rows,
                 selected_bookmark: self.overlay.selected_bookmark,
                 bookmark_status: &self.bookmark_status,
-                bookmark_more: [
-                    self.overlay.bookmark_offset > 0,
-                    self.overlay.bookmark_offset + overlay::BOOKMARK_ROWS < indices.len(),
-                ],
+                bookmark_add_menu: self.bookmark_add_menu,
+                can_add_bookmark_child: !self.original_export && self.overlay.selected_bookmark
+                    .and_then(|index| self.bookmarks.as_ref()?.entries.get(index))
+                    .is_some_and(|entry| entry.depth < 127),
             },
         );
         if self.store_update_available
@@ -415,8 +421,9 @@ impl Reader {
                 self.overlay.selected_bookmark = Some(index);
                 self.go_to_bookmark(hwnd);
             }
-            Event::BookmarkScroll(direction) => self.scroll_bookmarks(direction),
-            Event::BookmarkAdd | Event::BookmarkChild(_) | Event::BookmarkEdit(_) => {
+            Event::BookmarkAddMenu => self.bookmark_add_menu = !self.bookmark_add_menu,
+            Event::BookmarkAdd(_) | Event::BookmarkEdit(_) => {
+                self.bookmark_add_menu = false;
                 self.bookmark_edit = Some(event);
                 post(hwnd, EDIT_BOOKMARK);
             }
@@ -434,7 +441,6 @@ impl Reader {
                 }
                 self.scroll_bookmarks(0);
             }
-            Event::BookmarkDrag(_) => {}
             Event::Finalize => post(hwnd, EXPORT_PDF),
             Event::DefaultPdf => {
                 let _ = unsafe { PostMessageW(Some(hwnd), DEFAULT_PDF, WPARAM(1), LPARAM(0)) };
@@ -690,7 +696,6 @@ impl Reader {
         };
         if let Some(page) = entry.page.and_then(|page| score.index(page.checked_sub(1)?)) {
             self.go_to(hwnd, page);
-            self.close_drawer(hwnd);
         } else {
             self.notify(
                 hwnd,
@@ -761,8 +766,11 @@ impl Reader {
             .min(max);
     }
 
-    pub(super) fn bookmark_wheel(&mut self, hwnd: HWND, delta: i32) -> bool {
-        if self.overlay.drawer && self.overlay.sheet == Some(Sheet::Bookmarks) {
+    pub(super) fn bookmark_wheel(&mut self, hwnd: HWND, point: POINT, delta: i32) -> bool {
+        if self.overlay.drawer && self.overlay.sheet == Some(Sheet::Bookmarks)
+            && self.cards(&Layout::new(hwnd, self.fullscreen.is_some()))
+                .iter().any(|card| card.drawer && inside(card.rect, point))
+        {
             self.bookmark_wheel_delta += delta;
             let step = self.bookmark_wheel_delta / 60;
             self.bookmark_wheel_delta %= 60;
@@ -773,70 +781,6 @@ impl Reader {
             return true;
         }
         false
-    }
-
-    pub(super) fn scroll_dragging_bookmark(&mut self, hwnd: HWND) {
-        let Some(at) = self.bookmark_drag else { return };
-        let layout = Layout::new(hwnd, self.fullscreen.is_some());
-        let cards = self.cards(&layout);
-        let Some(card) = cards.iter().rev().find(|card| {
-            card.buttons
-                .iter()
-                .any(|button| matches!(button.event, Event::BookmarkSelect(_)))
-        }) else {
-            return;
-        };
-        if at.x < card.rect.left || at.x >= card.rect.right {
-            return;
-        }
-        let top = card.rect.top + (93.0 * card.scale) as i32;
-        let bottom = card.rect.bottom - (61.0 * card.scale) as i32;
-        let step = if at.y <= top {
-            -1
-        } else if at.y >= bottom {
-            1
-        } else {
-            0
-        };
-        let previous = self.overlay.bookmark_offset;
-        self.scroll_bookmarks(step);
-        if self.overlay.bookmark_offset != previous {
-            repaint(hwnd);
-        }
-    }
-
-    fn drop_bookmark(&mut self, hwnd: HWND, layout: &Layout, from: usize, at: POINT) {
-        let Some((target, rect)) = self
-            .cards(layout)
-            .iter()
-            .rev()
-            .filter(|card| inside(card.rect, at))
-            .flat_map(|card| &card.buttons)
-            .find_map(|button| match button.event {
-                Event::BookmarkSelect(index)
-                    if at.y >= button.rect.top && at.y < button.rect.bottom =>
-                {
-                    Some((index, button.rect))
-                }
-                _ => None,
-            })
-        else {
-            return;
-        };
-        let part = (at.y - rect.top) * 4 / (rect.bottom - rect.top).max(1);
-        let pos = match part {
-            0 => pdf_edit::DropPosition::Before,
-            3 => pdf_edit::DropPosition::After,
-            _ => pdf_edit::DropPosition::Child,
-        };
-        if let Some(mut bookmarks) = self.bookmarks.clone()
-            && let Some(index) = bookmarks.move_branch(from, target, pos)
-            && self.save_bookmarks(hwnd, bookmarks)
-        {
-            self.collapsed_bookmarks.clear();
-            self.overlay.selected_bookmark = Some(index);
-            self.scroll_bookmarks(0);
-        }
     }
 
     fn save_bookmark_structure(&mut self, hwnd: HWND, bookmarks: Bookmarks, next: Option<usize>) {
@@ -1044,7 +988,17 @@ impl Reader {
                 };
                 let hot = control.enabled && self.overlay_hover.is_some_and(|at| inside(clip, at) && inside(control.rect, at));
                 with_clip(dc, clip, || {
-                if let Some(color) = control.color {
+                if matches!(control.event, Event::BookmarkSelect(_)) {
+                    if hot || control.active {
+                        rounded(dc, control.rect, if control.active { blend_color(PANEL, ACCENT, 17) } else { SURFACE }, px(8.0));
+                    }
+                    text_left(dc, RECT { left: control.rect.left + px(7.0), right: card.rect.right - px(60.0), ..control.rect },
+                        &control.text, if control.active { ACCENT } else { TEXT }, px(14.0));
+                } else if matches!(control.event, Event::BookmarkCollapse(_)) {
+                    if let Some(icon) = control.icon {
+                        icons::draw(dc, icon, control.rect, 16.0 * card.scale, if hot { ACCENT } else { MUTED });
+                    }
+                } else if let Some(color) = control.color {
                     if control.active {
                         rounded(dc, control.rect, ACCENT, px(19.0));
                     }
@@ -1144,15 +1098,6 @@ impl Reader {
                 }
             }
             });
-        }
-        if let Some(at) = self.bookmark_drag {
-            let mark = RECT {
-                left: at.x - layout.px(10),
-                top: at.y - layout.px(10),
-                right: at.x + layout.px(10),
-                bottom: at.y + layout.px(10),
-            };
-            circle(dc, mark, ACCENT, BACKGROUND, 1.6 * layout.scale);
         }
         if let Some(message) = &self.toast {
             let area = RECT {
@@ -1684,12 +1629,8 @@ pub(super) fn bookmark_dialog(hwnd: HWND, state: &RefCell<Reader>) {
                     }
                     app.save_bookmarks(hwnd, bookmarks);
                 }
-                (Event::BookmarkAdd, Some(page)) => {
-                    let index = bookmarks.add(value, page);
-                    app.save_bookmark_structure(hwnd, bookmarks, Some(index));
-                }
-                (Event::BookmarkChild(parent), Some(page)) => {
-                    if let Some(index) = bookmarks.add_child(parent, value, page) {
+                (Event::BookmarkAdd(position), Some(page)) => {
+                    if let Some(index) = bookmarks.insert(position, value, page) {
                         app.save_bookmark_structure(hwnd, bookmarks, Some(index));
                     }
                 }

@@ -73,10 +73,10 @@ const DEFAULT_PDF: u32 = WM_APP + 14;
 const SHOW_FEEDBACK: u32 = WM_APP + 15;
 const CHECK_STORE_UPDATE: u32 = WM_APP + 16;
 const STORE_UPDATE_AVAILABLE: u32 = WM_APP + 17;
-const BOOKMARK_DRAG_TIMER: usize = 7;
 const INK_SAVE_TIMER: usize = 9;
 const READING_SAVE_TIMER: usize = 10;
 const THUMBNAIL_WARMUP_TIMER: usize = 11;
+const GRID_LOADING_TIMER: usize = 12;
 const VIEW_SETTLE_MS: u32 = 130;
 const INK_SAVE_MS: u32 = 180;
 const ZOOM_TIME: Duration = Duration::from_millis(170);
@@ -360,7 +360,7 @@ struct Reader {
     favorites: Favorites,
     collapsed_bookmarks: std::collections::HashSet<usize>,
     bookmark_edit: Option<Event>,
-    bookmark_drag: Option<POINT>,
+    bookmark_add_menu: bool,
     bookmark_scroll_y: Option<i32>,
     bookmark_wheel_delta: i32,
     resume_page: Option<u32>,
@@ -370,6 +370,8 @@ struct Reader {
     bookmark_source: Option<ScoreFile>,
     bookmark_status: String,
     bookmark_loading: Option<mpsc::Receiver<std::result::Result<Bookmarks, String>>>,
+    pending_drawer: Option<Sheet>,
+    drawer_tool: Option<Tool>,
     exporting: Option<mpsc::Receiver<std::result::Result<tools::Finalized, String>>>,
     export_report: Option<String>,
     toast: Option<String>,
@@ -444,6 +446,9 @@ impl Reader {
             },
             WM_TIMER if wp.0 == RESIZE_TIMER => {
                 let _ = unsafe { KillTimer(Some(hwnd), RESIZE_TIMER) };
+                if self.page_grid_open() {
+                    self.update_thumbnails(hwnd, &Layout::new(hwnd, self.fullscreen.is_some()));
+                }
                 if self.zoom_animation.is_none() {
                     if self.ink.is_drawing() {
                         self.defer_view_refresh(hwnd);
@@ -459,6 +464,7 @@ impl Reader {
             }
             WM_TIMER if wp.0 == READING_SAVE_TIMER => self.save_reading_position(hwnd),
             WM_TIMER if wp.0 == THUMBNAIL_WARMUP_TIMER => self.warm_thumbnails(hwnd),
+            WM_TIMER if wp.0 == GRID_LOADING_TIMER => self.tick_grid_loading(hwnd),
             WM_TIMER | ANIMATION_FRAME if msg == ANIMATION_FRAME || wp.0 == RADIAL_TIMER => {
                 let finished = self.animate_frame(hwnd);
                 // WM_PAINT is normally generated only after the input queue drains.
@@ -496,7 +502,6 @@ impl Reader {
                 repaint(hwnd);
             }
             WM_TIMER if wp.0 == UTILITIES_TIMER => self.check_utilities_idle(hwnd),
-            WM_TIMER if wp.0 == BOOKMARK_DRAG_TIMER => self.scroll_dragging_bookmark(hwnd),
             WM_DPICHANGED => unsafe {
                 let rect = &*(lp.0 as *const RECT);
                 let _ = SetWindowPos(
@@ -627,7 +632,7 @@ impl Reader {
                     let at = (point.x as f32, point.y as f32);
                     self.transform_view(hwnd, at, at, 1.25_f32.powf(delta as f32 / 120.0));
                 } else if !horizontal
-                    && (self.favorite_wheel(hwnd, point, delta) || self.bookmark_wheel(hwnd, delta))
+                    && (self.favorite_wheel(hwnd, point, delta) || self.bookmark_wheel(hwnd, point, delta))
                 {
                 } else if self.overlay.drawer
                     || self.overlay.grab.is_some()
@@ -814,12 +819,15 @@ impl Reader {
         self.queued.clear();
         self.scores.clear();
         self.bookmarks = None;
+        self.bookmark_add_menu = false;
         self.bookmark_loading = None;
         self.bookmark_source = None;
         self.ink = Ink::default();
         self.recovered_page = false;
         self.radial.open = false;
         self.overlay.dismiss_drawer();
+        self.pending_drawer = None;
+        self.drawer_tool = None;
         self.chrome_menu = None;
         self.chrome_visual = None;
         self.overlay.popup_open = false;
@@ -1300,6 +1308,17 @@ impl Reader {
         let old = self.radial.footprint(bounds, scale);
         let previous_cards = self.animated_card_bounds(&layout);
         let overlay = self.overlay.tick();
+        let switched_drawer = if self.overlay.drawer_closed() {
+            if let Some(sheet) = self.pending_drawer.take() {
+                self.open_sheet(hwnd, sheet);
+                true
+            } else {
+                self.drawer_tool = None;
+                false
+            }
+        } else {
+            false
+        };
         if !self.overlay.popup_open && self.overlay.popup_opacity == 0.0 { self.chrome_visual = None; }
         let obstacles = self.radial_obstacles(&layout);
         let radial = self.radial.tick(bounds, layout.scale, &obstacles);
@@ -1358,7 +1377,7 @@ impl Reader {
                 }
             }
         }
-        if !radial && !overlay && !zooming && !self.view_moving && !dragging_page && turn_frame.is_none() {
+        if !radial && !overlay && !switched_drawer && !zooming && !self.view_moving && !dragging_page && turn_frame.is_none() {
             if let Some(clock) = &self.animation {
                 clock.stop();
             }
@@ -1916,7 +1935,6 @@ impl Reader {
             self.animate(hwnd);
         }
         self.sync_search(hwnd, &layout);
-        self.update_thumbnails(hwnd, &layout);
         let mut paint = PAINTSTRUCT::default();
         unsafe {
             let dc = BeginPaint(hwnd, &mut paint);
@@ -1930,17 +1948,12 @@ impl Reader {
                 {
                     drag.prepare(dc, layout.viewport, frame);
                 }
-                if let Some(animation) = &mut self.page_animation
-                    && animation.started.is_none()
-                {
-                    if animation.prepare(self.page_surface.as_ref()) {
-                        self.animate(hwnd);
-                    } else {
-                        self.page_animation = None;
-                    }
+                if self.page_animation.is_some() && self.page_surface.is_none() {
+                    self.page_animation = None;
                 }
                 if self.paint_direct2d(hwnd, dc, &layout, paint.rcPaint) {
                     let _ = EndPaint(hwnd, &paint);
+                    self.start_presented_turn(hwnd);
                     return;
                 }
                 let (width, height) = (layout.client.right, layout.client.bottom);
@@ -1973,6 +1986,16 @@ impl Reader {
                 }
             }
             let _ = EndPaint(hwnd, &paint);
+        }
+        self.start_presented_turn(hwnd);
+    }
+
+    fn start_presented_turn(&mut self, hwnd: HWND) {
+        if let Some(animation) = &mut self.page_animation
+            && animation.started.is_none()
+        {
+            animation.started = Some(Instant::now());
+            self.animate(hwnd);
         }
     }
 
@@ -2089,7 +2112,7 @@ impl Reader {
             );
         }
         let save = self.save_status();
-        if !self.page_grid_open() && !self.radial.dragging() {
+        if !self.page_grid_open() {
             self.draw_radial(dc, layout, damage, &save);
         }
         let notice = match &save {
@@ -2107,9 +2130,6 @@ impl Reader {
             button(dc, bounds, notice, false, layout.scale);
         }
         self.draw_overlays(dc, layout, damage);
-        if !self.page_grid_open() && self.radial.dragging() {
-            self.draw_radial(dc, layout, damage, &save);
-        }
     }
 
     fn radial_area(&self, layout: &Layout) -> (RECT, f32) {
@@ -2136,6 +2156,7 @@ impl Reader {
             None
         };
         self.cards(layout).into_iter().chain(closing_popup)
+            .filter(|card| !card.drawer)
             .filter_map(|card| intersect(card.rect, layout.viewport))
             .collect()
     }
@@ -2308,12 +2329,6 @@ impl PageAnimation {
         Duration::from_millis((235 - 145 * i64::from(self.distance.min(width)) / i64::from(width)) as u64)
     }
 
-    fn prepare(&mut self, incoming: Option<&PageSurface>) -> bool {
-        if incoming.is_none() { return false; }
-        self.started = Some(Instant::now());
-        true
-    }
-
     fn draw(&self, dc: HDC, damage: RECT, incoming: Option<&PageSurface>) -> bool {
         let Some((travel, width, direction, edge, progress)) = self.position() else { return false };
         let Some(damage) = intersect(self.viewport, damage) else { return false };
@@ -2326,7 +2341,7 @@ impl PageAnimation {
     }
 
     fn position(&self) -> Option<(i32, i32, i32, i32, f32)> {
-        let progress = self.started?.elapsed().as_secs_f32() / self.duration().as_secs_f32();
+        let progress = self.started.map_or(0.0, |start| start.elapsed().as_secs_f32() / self.duration().as_secs_f32());
         if progress >= 1.0 {
             return None;
         }

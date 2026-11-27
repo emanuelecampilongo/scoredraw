@@ -119,6 +119,8 @@ pub struct Radial {
     display_scale: Option<f32>,
     pub open: bool,
     group: Group,
+    next_group: Option<Group>,
+    group_progress: f32,
 }
 
 impl Radial {
@@ -183,7 +185,10 @@ impl Radial {
 
     pub fn items(&self, viewport: RECT, scale: f32) -> impl Iterator<Item = (Command, RECT)> {
         let center = self.center(viewport, scale);
-        let progress = self.expansion();
+        let level = if self.next_group.is_some() || self.group_progress > 0.0 {
+            1.0 - self.group_progress
+        } else { 1.0 };
+        let progress = self.expansion() * level;
         let commands: &[Command] = if progress < 0.25 {
             &[]
         } else {
@@ -209,7 +214,7 @@ impl Radial {
                 let Command::Tool(tool) = command else {
                     return None;
                 };
-                if !tool.has_options() || self.expansion() < 0.8 {
+                if !tool.has_options() || self.expansion() * (1.0 - self.group_progress) < 0.8 {
                     return None;
                 }
                 let radius = (rect.right - rect.left) as f32 / 2.0;
@@ -225,7 +230,7 @@ impl Radial {
         }
         self.options(viewport, scale)
             .chain(self.items(viewport, scale))
-            .filter(|_| self.open)
+            .filter(|_| self.open && self.next_group.is_none() && self.group_progress == 0.0)
             .find_map(|(command, rect)| hit(rect, point).then_some(Target::Item(command)))
     }
 
@@ -250,10 +255,6 @@ impl Radial {
             contact: None,
         });
         true
-    }
-
-    pub fn dragging(&self) -> bool {
-        self.grab.as_ref().is_some_and(|grab| grab.drag)
     }
 
     pub fn grabbed(&self, id: u32) -> bool {
@@ -293,13 +294,15 @@ impl Radial {
                 self.open = !self.open;
                 if self.open {
                     self.group = Group::Tools;
+                    self.next_group = None;
+                    self.group_progress = 0.0;
                 }
                 None
             }
             (Target::Item(a), Some(Target::Item(b))) if a == b => {
                 match a {
-                    Command::Shapes => self.group = Group::Shapes,
-                    Command::Back => self.group = Group::Tools,
+                    Command::Shapes => self.next_group = Some(Group::Shapes),
+                    Command::Back => self.next_group = Some(Group::Tools),
                     _ => return Some(a),
                 }
                 None
@@ -345,10 +348,19 @@ impl Radial {
         self.display_scale = Some(scale);
         let center = self.center(viewport, scale);
         let previous = self.progress;
+        let old_group_progress = self.group_progress;
+        if self.next_group.is_some() {
+            self.group_progress = (self.group_progress + dt / 0.075).min(1.0);
+            if self.group_progress >= 1.0 {
+                self.group = self.next_group.take().unwrap();
+            }
+        } else {
+            self.group_progress = (self.group_progress - dt / 0.115).max(0.0);
+        }
         let direction = if self.open { 1.0 } else { -1.0 };
         self.progress = (self.progress + direction * dt / 0.18).clamp(0.0, 1.0);
         let radius = self.margin(scale) + 1.0;
-        let changing = self.progress != previous || scale != previous_scale;
+        let changing = self.progress != previous || scale != previous_scale || self.group_progress != old_group_progress;
 
         // A panel can grow into the menu. Resolve the overlap over several frames.
         if !is_clear(center, viewport, radius, obstacles) {

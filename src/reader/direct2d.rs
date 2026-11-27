@@ -27,7 +27,9 @@ impl Renderer {
             let window = D2D1_HWND_RENDER_TARGET_PROPERTIES {
                 hwnd,
                 pixelSize: size,
-                presentOptions: D2D1_PRESENT_OPTIONS_RETAIN_CONTENTS,
+                // The reader already paces animation submissions. A second wait
+                // here can turn a slightly late submission into a missed frame.
+                presentOptions: D2D1_PRESENT_OPTIONS_RETAIN_CONTENTS | D2D1_PRESENT_OPTIONS_IMMEDIATELY,
             };
             let mut properties = D2D1_RENDER_TARGET_PROPERTIES {
                 r#type: D2D1_RENDER_TARGET_TYPE_HARDWARE,

@@ -2,6 +2,7 @@ use crate::data::Style;
 use crate::icons::Glyph;
 use crate::ink::Tool;
 use crate::language::LanguagePreference;
+use crate::pdf_edit::BookmarkPosition;
 use crate::radial::Command;
 use std::time::Instant;
 use windows::Win32::Foundation::{COLORREF, POINT, RECT};
@@ -61,13 +62,11 @@ pub enum Event {
     ToggleTap,
     Language(LanguagePreference),
     BookmarkSelect(usize),
-    BookmarkScroll(i32),
-    BookmarkAdd,
+    BookmarkAddMenu,
+    BookmarkAdd(BookmarkPosition),
     BookmarkEdit(usize),
     BookmarkDelete(usize),
-    BookmarkChild(usize),
     BookmarkCollapse(usize),
-    BookmarkDrag(usize),
     Finalize,
     CloseDocument,
     DefaultPdf,
@@ -167,7 +166,8 @@ pub struct Model<'a> {
     pub bookmarks: &'a [BookmarkRow<'a>],
     pub selected_bookmark: Option<usize>,
     pub bookmark_status: &'a str,
-    pub bookmark_more: [bool; 2],
+    pub bookmark_add_menu: bool,
+    pub can_add_bookmark_child: bool,
 }
 
 #[derive(Default)]
@@ -286,6 +286,10 @@ impl Overlay {
         self.progress = 0.0;
     }
 
+    pub fn drawer_closed(&self) -> bool {
+        !self.drawer && self.progress == 0.0
+    }
+
     pub fn toggle_audio(&mut self, slot: usize) -> bool {
         let panel = &mut self.floating[slot];
         panel.visible = !panel.visible;
@@ -371,14 +375,6 @@ impl Overlay {
         }
     }
 
-    pub fn drawer_reservation(&self, viewport: RECT, scale: f32) -> i32 {
-        if (!self.drawer && self.progress == 0.0) || self.sheet == Some(Sheet::Page) {
-            return 0;
-        }
-        let width = if self.sheet == Some(Sheet::Bookmarks) { 386.0 } else { 320.0 };
-        (width * scale).round().min((viewport.right - viewport.left) as f32 * 0.64) as i32
-    }
-
     pub fn cards(&self, viewport: RECT, scale: f32, data: &Model<'_>) -> Vec<Card> {
         let mut cards = Vec::new();
         let px = |x: i32| (x as f32 * scale).round() as i32;
@@ -392,10 +388,6 @@ impl Overlay {
         }
         let mut obstacles: Vec<_> = data.popup.into_iter()
             .chain(cards.iter().map(|card| card.rect)).collect();
-        let drawer = self.drawer_reservation(viewport, scale);
-        if drawer > 0 {
-            obstacles.push(RECT { right: viewport.left + drawer, ..viewport });
-        }
         for (slot, panel) in self
             .floating
             .iter()
@@ -541,10 +533,10 @@ impl Overlay {
             .min(vw as f32 * 0.64 / width_dp as f32);
         let width = (width_dp as f32 * scale).round() as i32;
         let position = 1.0 - (1.0 - self.progress).powi(3);
-        let x = viewport.left + ((position - 1.0) * width as f32).round() as i32;
-        let height = (height_dp as f32 * scale).round() as i32;
-        let mut card = Card::new(x, viewport.top, width, height, scale, None);
+        let x = viewport.left - ((1.0 - position) * width as f32).round() as i32;
+        let mut card = Card::new(x, viewport.top, width, vh, scale, None);
         card.drawer = true;
+        card.interactive = self.drawer;
         let style_title;
         let title = match sheet {
             Sheet::Page => unreachable!(),
@@ -562,8 +554,8 @@ impl Overlay {
         };
         card.label([52, 6, 203, 36], title, 20, false);
         card.icon(
-            [width_dp - 46, 9, 34, 32],
-            Glyph::X,
+            [10, 9, 34, 32],
+            Glyph::ChevronLeft,
             Event::CloseDrawer,
             true,
         );
@@ -575,11 +567,12 @@ impl Overlay {
             Sheet::About => card.about(),
         }
         cards.push(card);
+        cards.sort_by_key(|card| card.dock);
         cards
     }
 
     fn utilities_panel(&self, viewport: RECT, scale: f32, data: &Model<'_>, cards: &mut Vec<Card>) {
-        let width = if data.concert_navigation.is_some() { 606 } else { 506 };
+        let width = if data.concert_navigation.is_some() { 652 } else { 552 };
         let scale = scale.min((viewport.right - viewport.left) as f32 / (width + 18) as f32);
         let px = |x: i32| (x as f32 * scale).round() as i32;
         let middle = (viewport.left + viewport.right) / 2;
@@ -650,6 +643,7 @@ impl Overlay {
             dock.icon([497, 6, 43, 41], Glyph::SkipForward, Event::ScoreTurn(1), next);
             dock.separator(546);
         }
+        dock.icon([width - 102, 6, 42, 41], Glyph::Bookmark, Event::Sheet(Sheet::Bookmarks), true);
         dock.icon(
             [width - 54, 6, 46, 41],
             if data.fullscreen {
@@ -871,74 +865,48 @@ impl Card {
 
     fn bookmarks(&mut self, data: &Model<'_>) {
         use Event as E;
-        self.label([11, 46, 188, 34], data.bookmark_status, 12, true);
-        self.action(
-            [268, 46, 105, 34],
-            tr!("+ Aggiungi", "+ Add"),
-            E::BookmarkAdd,
-            true,
-            data.can_add_bookmark,
-        );
+        let selected = data.selected_bookmark.unwrap_or(0);
+        let selected_enabled = data.selected_bookmark.is_some() && data.can_add_bookmark;
+        for (i, (icon, event, enabled)) in [
+            (Glyph::Plus, E::BookmarkAddMenu, data.can_add_bookmark),
+            (Glyph::Pencil, E::BookmarkEdit(selected), selected_enabled),
+            (Glyph::Trash, E::BookmarkDelete(selected), selected_enabled),
+        ].into_iter().enumerate() {
+            self.icon([14 + i as i32 * 51, 49, 42, 34], icon, event, enabled);
+        }
+        self.label([14, 86, 355, 25], data.bookmark_status, 12, true);
+        if data.bookmark_add_menu {
+            self.label([14, 114, 355, 30], tr!("Posizione del nuovo segnalibro", "New bookmark position"), 15, false);
+            for (row, (label, position, enabled)) in [
+                (tr!("All’inizio dell’elenco", "At the beginning"), BookmarkPosition::First, true),
+                (tr!("Alla fine dell’elenco", "At the end"), BookmarkPosition::Last, true),
+                (tr!("Dopo il segnalibro selezionato", "After the selected bookmark"), BookmarkPosition::After(selected), selected_enabled),
+                (tr!("Come figlio del selezionato", "As a child of the selected bookmark"), BookmarkPosition::Child(selected), data.can_add_bookmark_child),
+            ].into_iter().enumerate() {
+                self.action([20, 151 + row as i32 * 49, 346, 41], label,
+                    E::BookmarkAdd(position), false, data.can_add_bookmark && enabled);
+            }
+            return;
+        }
         for (row, item) in data.bookmarks.iter().enumerate() {
-            let y = 88 + row as i32 * 51;
-            let indent = item.depth.min(4) as i32 * 9;
+            let y = 114 + row as i32 * 51;
+            let indent = item.depth.min(7) as i32 * 15;
             if item.branch {
                 self.icon(
-                    [7 + indent, y, 29, 42],
-                    if item.collapsed {
-                        Glyph::ChevronRight
-                    } else {
-                        Glyph::ChevronDown
-                    },
+                    [10 + indent, y, 28, 43],
+                    if item.collapsed { Glyph::ChevronRight } else { Glyph::ChevronDown },
                     E::BookmarkCollapse(item.index),
                     true,
                 );
             }
-            let left = 12 + indent + if item.branch { 25 } else { 0 };
+            let left = 40 + indent;
             self.button(
-                [left, y, 207 - left, 42],
-                format!("{} {}", item.title, item.detail),
+                [left, y, 371 - left, 43],
+                item.title,
                 E::BookmarkSelect(item.index),
                 data.selected_bookmark == Some(item.index),
             );
-            self.icon(
-                [212, y, 38, 42],
-                Glyph::Pencil,
-                E::BookmarkEdit(item.index),
-                true,
-            );
-            self.icon(
-                [253, y, 38, 42],
-                Glyph::Plus,
-                E::BookmarkChild(item.index),
-                true,
-            );
-            self.icon(
-                [294, y, 38, 42],
-                Glyph::Trash,
-                E::BookmarkDelete(item.index),
-                true,
-            );
-            self.icon(
-                [335, y, 38, 42],
-                Glyph::Move,
-                E::BookmarkDrag(item.index),
-                true,
-            );
-        }
-        if data.bookmark_more.iter().any(|&more| more) {
-            self.icon(
-                [89, 453, 61, 43],
-                Glyph::ChevronUp,
-                E::BookmarkScroll(-1),
-                data.bookmark_more[0],
-            );
-            self.icon(
-                [171, 453, 61, 43],
-                Glyph::ChevronDown,
-                E::BookmarkScroll(1),
-                data.bookmark_more[1],
-            );
+            self.label([334, y, 38, 43], &item.detail, 12, true);
         }
     }
 

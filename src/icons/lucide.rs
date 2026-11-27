@@ -15,7 +15,6 @@ pub enum Glyph {
     ChevronRight,
     SkipBack,
     SkipForward,
-    ChevronUp,
     ChevronDown,
     Plus,
     Minus,
@@ -37,6 +36,7 @@ pub enum Glyph {
     FileText,
     PageRange,
     Bookmark,
+    Search,
     Info,
     Copy,
     Home,
@@ -46,6 +46,13 @@ pub enum Glyph {
 impl Glyph {
     pub(super) fn path(self) -> &'static [Segment] {
         match self {
+            Self::Search => &[
+                Move(17.0, 10.0), Curve(17.0, 13.9, 13.9, 17.0, 10.0, 17.0),
+                Curve(6.1, 17.0, 3.0, 13.9, 3.0, 10.0),
+                Curve(3.0, 6.1, 6.1, 3.0, 10.0, 3.0),
+                Curve(13.9, 3.0, 17.0, 6.1, 17.0, 10.0), Close,
+                Move(15.0, 15.0), Line(21.0, 21.0),
+            ],
             Self::SkipBack => &[
                 Move(5.0, 4.0), Line(5.0, 20.0),
                 Move(19.0, 5.0), Line(9.0, 12.0), Line(19.0, 19.0), Close,
@@ -211,7 +218,6 @@ impl Glyph {
             Self::ChevronLeft => &[Move(15.0, 18.0), Line(9.0, 12.0), Line(15.0, 6.0)],
             Self::ChevronRight => &[Move(9.0, 18.0), Line(15.0, 12.0), Line(9.0, 6.0)],
             Self::ChevronDown => &[Move(6.0, 9.0), Line(12.0, 15.0), Line(18.0, 9.0)],
-            Self::ChevronUp => &[Move(18.0, 15.0), Line(12.0, 9.0), Line(6.0, 15.0)],
             Self::Plus => &[
                 Move(5.0, 12.0),
                 Line(19.0, 12.0),

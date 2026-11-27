@@ -9,6 +9,35 @@ pub const FAVORITE_ROWS: usize = 3;
 pub const FAVORITE_ROW: i32 = 48;
 pub const BOOKMARK_ROWS: usize = 7;
 
+#[derive(Clone, Copy)]
+pub struct Scrollbar {
+    pub track: RECT,
+    pub thumb: RECT,
+    max_scroll: f32,
+}
+
+impl Scrollbar {
+    pub fn new(track: RECT, max_scroll: f32, scroll: f32, min_thumb: i32, scale: f32) -> Option<Self> {
+        let height = track.bottom - track.top;
+        if max_scroll <= 0.0 || height < 2 { return None; }
+        let ratio = height as f32 / (height as f32 + max_scroll * scale);
+        let length = (height as f32 * ratio).round() as i32;
+        let length = length.clamp(min_thumb.clamp(1, height - 1), height - 1);
+        let start = track.top + ((height - length) as f32 * scroll.clamp(0.0, max_scroll) / max_scroll).round() as i32;
+        Some(Self { track, thumb: RECT { top: start, bottom: start + length, ..track }, max_scroll })
+    }
+
+    pub fn grab(self, y: i32) -> i32 {
+        let length = self.thumb.bottom - self.thumb.top;
+        if (self.thumb.top..self.thumb.bottom).contains(&y) { y - self.thumb.top } else { length / 2 }
+    }
+
+    pub fn scroll(self, y: i32, grab: i32) -> f32 {
+        let travel = self.track.bottom - self.track.top - (self.thumb.bottom - self.thumb.top);
+        self.max_scroll * ((y - grab - self.track.top) as f32 / travel as f32).clamp(0.0, 1.0)
+    }
+}
+
 pub const SWATCHES: [u32; 12] = [
     0x392b22, 0xfdfaf7, 0xef9343, 0x5951e1, 0xc990ae, 0xfea39c, 0x88c148, 0x92e7af, 0x51e1ff,
     0x62c9ff, 0x4569f6, 0xb974ed,
@@ -176,6 +205,7 @@ pub struct Grab {
     pub origin: POINT,
     drag: Option<(usize, POINT, POINT)>,
     pub favorite_scroll: Option<(f32, f32)>,
+    pub favorite_bar: Option<(Scrollbar, i32)>,
 }
 
 impl Grab {
@@ -187,6 +217,7 @@ impl Grab {
             slider: None,
             drag: None,
             favorite_scroll: None,
+            favorite_bar: None,
         }
     }
 }
@@ -207,7 +238,7 @@ pub struct Card {
     pub interactive: bool,
     pub favorite_clip: Option<RECT>,
     pub favorite_labels_start: usize,
-    pub favorite_thumb: Option<RECT>,
+    pub favorite_bar: Option<Scrollbar>,
     pub scale: f32,
     pub meter: Option<(RECT, Meter)>,
 }
@@ -278,6 +309,10 @@ impl Overlay {
 
     pub fn audio_visible(&self) -> bool {
         self.floating.iter().any(|panel| panel.visible)
+    }
+
+    pub fn reset_frame_time(&mut self) {
+        self.last_frame = None;
     }
 
     pub fn tick(&mut self) -> bool {
@@ -707,7 +742,7 @@ impl Card {
             interactive: true,
             favorite_clip: None,
             favorite_labels_start: usize::MAX,
-            favorite_thumb: None,
+            favorite_bar: None,
             meter: None,
             scale,
         }
@@ -748,6 +783,7 @@ impl Card {
             drag,
             slider,
             favorite_scroll: None,
+            favorite_bar: None,
         }
     }
 
@@ -1109,12 +1145,10 @@ impl Card {
                     for label in self.labels.iter_mut().rev().take(2) { label.dark = true; }
                 }
             }
-            if favorites.len() > FAVORITE_ROWS {
-                let fraction = FAVORITE_ROWS as f32 / favorites.len() as f32;
-                let size = (height as f32 * fraction).round().max(12.0) as i32;
-                let y = 393 + ((height - size) as f32 * scroll / favorite_max_scroll(favorites.len())).round() as i32;
-                self.favorite_thumb = Some(self.rect([300, y, 3, size]));
-            }
+            self.favorite_bar = Scrollbar::new(
+                self.rect([298, 393, 11, height]), favorite_max_scroll(favorites.len()),
+                scroll, (20.0 * self.scale).round() as i32, self.scale,
+            );
         }
     }
 }

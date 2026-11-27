@@ -55,6 +55,7 @@ impl Reader {
             }
             Command::Open => request_file_picker(hwnd),
             Command::Library => post(hwnd, OPEN_LIBRARY),
+            Command::Metronome | Command::Tuner if self.visible.is_none() => return,
             Command::Metronome | Command::Tuner => {
                 let slot = usize::from(command == Command::Tuner);
                 if !self.overlay.toggle_audio(slot) {
@@ -186,7 +187,14 @@ impl Reader {
                     return true;
                 }
                 let mut grab = card.grab(id, at);
-                if card.favorite_clip.is_some_and(|clip| inside(clip, at)) {
+                if let Some(bar) = card.favorite_bar && inside(bar.track, at) {
+                    let offset = bar.grab(at.y);
+                    grab = overlay::Grab::dismiss(id, at);
+                    grab.favorite_bar = Some((bar, offset));
+                    if !(bar.thumb.top..bar.thumb.bottom).contains(&at.y) {
+                        self.set_favorite_scroll(bar.scroll(at.y, offset));
+                    }
+                } else if card.favorite_clip.is_some_and(|clip| inside(clip, at)) {
                     grab.favorite_scroll = Some((self.overlay.favorite_scroll, card.scale));
                 }
                 if self.chrome_menu.is_some()
@@ -210,7 +218,9 @@ impl Reader {
             WM_POINTERUPDATE if self.overlay.grab.is_some_and(|grab| grab.id == id) => {
                 if let Some(grab) = self.overlay.grab {
                     let dy = at.y - grab.origin.y;
-                    if let Some((start, scale)) = grab.favorite_scroll
+                    if let Some((bar, offset)) = grab.favorite_bar {
+                        self.set_favorite_scroll(bar.scroll(at.y, offset));
+                    } else if let Some((start, scale)) = grab.favorite_scroll
                         && (dy.abs() >= layout.px(5) || self.bookmark_scroll_y.is_some())
                     {
                         self.set_favorite_scroll(start - dy as f32 / scale);
@@ -999,14 +1009,20 @@ impl Reader {
                 continue;
             }
             with_clip(dc, affected, || {
+            let w = affected.right - affected.left;
+            let h = affected.bottom - affected.top;
+            let mut scratch = self.blend_buffer.borrow_mut();
             let background = if card.opacity < 1.0 {
-                Surface::new(dc, affected.right - affected.left, affected.bottom - affected.top).map(|surface| {
-                    let w = affected.right - affected.left;
-                    let h = affected.bottom - affected.top;
+                if scratch.as_ref().is_none_or(|surface| surface.width < w || surface.height < h) {
+                    let (width, height) = scratch.as_ref().map_or((w, h), |surface| {
+                        (w.max(surface.width), h.max(surface.height))
+                    });
+                    *scratch = Surface::new(dc, width, height);
+                }
+                scratch.as_ref().inspect(|surface| {
                     unsafe {
                         let _ = BitBlt(surface.dc, 0, 0, w, h, Some(dc), affected.left, affected.top, SRCCOPY);
                     }
-                    surface
                 })
             } else { None };
             let px = |n: f32| (n * card.scale).round() as i32;
@@ -1018,6 +1034,9 @@ impl Reader {
                 rounded(dc, separator, MENU_BORDER, px(2.0));
             }
             for control in card.buttons {
+                if intersect(control.rect, affected).is_none() {
+                    continue;
+                }
                 let clip = if control.event.is_favorite_row() {
                     card.favorite_clip.unwrap_or(card.rect)
                 } else {
@@ -1079,6 +1098,9 @@ impl Reader {
                 });
             }
             for (index, label) in card.labels.into_iter().enumerate() {
+                if intersect(label.rect, affected).is_none() {
+                    continue;
+                }
                 let clip = if index >= card.favorite_labels_start {
                     card.favorite_clip.unwrap_or(card.rect)
                 } else {
@@ -1104,8 +1126,8 @@ impl Reader {
                         (style.width * 220.0).clamp(1.0, 14.0) * card.scale);
                 }
             });
-            if let Some(thumb) = card.favorite_thumb {
-                rounded(dc, thumb, MUTED, px(3.0));
+            if let Some(bar) = card.favorite_bar {
+                draw_scrollbar(dc, bar, card.scale);
             }
             if let Some((rect, meter)) = card.meter {
                 draw_meter(dc, rect, meter, card.scale);

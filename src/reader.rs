@@ -75,12 +75,15 @@ const CHECK_STORE_UPDATE: u32 = WM_APP + 16;
 const STORE_UPDATE_AVAILABLE: u32 = WM_APP + 17;
 const BOOKMARK_DRAG_TIMER: usize = 7;
 const INK_SAVE_TIMER: usize = 9;
+const READING_SAVE_TIMER: usize = 10;
+const THUMBNAIL_WARMUP_TIMER: usize = 11;
 const VIEW_SETTLE_MS: u32 = 130;
 const INK_SAVE_MS: u32 = 180;
 const ZOOM_TIME: Duration = Duration::from_millis(170);
 const WELCOME_LOGO: &[u8] = include_bytes!("../assets/scoredraw.png");
 
 mod animation;
+mod direct2d;
 mod association;
 mod browse;
 mod tools;
@@ -117,6 +120,7 @@ fn run_window(files: Vec<PathBuf>) -> Result<()> {
         favorites: store.favorites().unwrap_or_default(),
         tool: settings.active_tool,
         settings,
+        frame_timing: std::env::var_os("SCOREDRAW_RENDER_TRACE").map(|_| animation::FrameTiming::default()),
         ..Reader::default()
     });
     // The stack-owned state outlives the window and is removed from its data slot on destruction.
@@ -161,7 +165,7 @@ fn run_window(files: Vec<PathBuf>) -> Result<()> {
         if let Ok(mut app) = state.try_borrow_mut() {
             app.animation = Animation::new(hwnd).ok();
             app.trackpad = trackpad::Trackpad::register(hwnd);
-            let (requests, responses) = match render_queue::spawn(hwnd) {
+            let (requests, responses) = match render_queue::spawn(hwnd, store.thumbnail_cache()) {
                 Ok(channels) => channels,
                 Err(error) => {
                     let _ = DestroyWindow(hwnd);
@@ -321,6 +325,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
 struct Reader {
     welcome_logo: Option<canvas::Bitmap>,
     recent: Vec<ReadingPosition>,
+    reading_dirty: bool,
     browser: browse::Browser,
     session: u64,
     requests: Option<mpsc::Sender<Request>>,
@@ -341,6 +346,7 @@ struct Reader {
     trackpad: Option<trackpad::Trackpad>,
     view: View,
     view_moving: bool,
+    view_panning: bool,
     zoom_animation: Option<ZoomAnimation>,
     mouse_pan: Option<POINT>,
     settings: Settings,
@@ -369,6 +375,7 @@ struct Reader {
     toast: Option<String>,
     close_after_export: bool,
     animation: Option<Animation>,
+    frame_timing: Option<animation::FrameTiming>,
     slider_original: Option<Settings>,
     chrome_menu: Option<chrome::Menu>,
     chrome_visual: Option<chrome::Menu>,
@@ -381,6 +388,9 @@ struct Reader {
     close_document_after_save: bool,
     recovered_page: bool,
     paint_buffer: Option<Surface>,
+    direct2d: Option<direct2d::Renderer>,
+    direct2d_unavailable: bool,
+    blend_buffer: RefCell<Option<Surface>>,
     page_surface: Option<PageSurface>,
     animate_next_turn: bool,
     page_animation: Option<PageAnimation>,
@@ -439,6 +449,7 @@ impl Reader {
                         self.defer_view_refresh(hwnd);
                     } else {
                         self.view_moving = false;
+                        self.view_panning = false;
                         self.refresh(hwnd);
                     }
                 }
@@ -446,8 +457,25 @@ impl Reader {
             WM_TIMER if wp.0 == INK_SAVE_TIMER => {
                 self.save_ink(hwnd);
             }
-            WM_TIMER if wp.0 == RADIAL_TIMER => self.animate_frame(hwnd),
-            ANIMATION_FRAME => self.animate_frame(hwnd),
+            WM_TIMER if wp.0 == READING_SAVE_TIMER => self.save_reading_position(hwnd),
+            WM_TIMER if wp.0 == THUMBNAIL_WARMUP_TIMER => self.warm_thumbnails(hwnd),
+            WM_TIMER | ANIMATION_FRAME if msg == ANIMATION_FRAME || wp.0 == RADIAL_TIMER => {
+                let finished = self.animate_frame(hwnd);
+                // WM_PAINT is normally generated only after the input queue drains.
+                // Render the invalidated region now, even during continuous pointer input.
+                if unsafe { GetUpdateRect(hwnd, None, false) }.as_bool() {
+                    self.paint(hwnd);
+                    if let Some(timing) = &mut self.frame_timing {
+                        timing.painted(Instant::now());
+                    }
+                }
+                if let Some(clock) = &self.animation {
+                    clock.presented();
+                }
+                if finished && let Some(timing) = &mut self.frame_timing {
+                    timing.finish();
+                }
+            }
             WM_TIMER if wp.0 == AUDIO_TIMER => {
                 let playing = self.sound.running(0);
                 if self.sound.tick(self.settings.tuning_hz) {
@@ -507,6 +535,7 @@ impl Reader {
                 repaint_rect(hwnd, self.radial.hub(bounds, scale));
             }
             WM_CLOSE => {
+                self.save_reading_position(hwnd);
                 self.ink.cancel_contact();
                 if self.save_ink(hwnd) {
                     if self.exporting.is_some() {
@@ -795,7 +824,8 @@ impl Reader {
         self.chrome_visual = None;
         self.overlay.popup_open = false;
         self.overlay.popup_opacity = 0.0;
-        self.leave_page_grid();
+        self.reset_thumbnails();
+        let _ = unsafe { KillTimer(Some(hwnd), THUMBNAIL_WARMUP_TIMER) };
         self.hide_utilities(hwnd);
         self.animate(hwnd);
         self.status.clear();
@@ -827,15 +857,20 @@ impl Reader {
             if let Some(worker) = &self.requests {
                 let _ = worker.send(Request::Close(self.session));
             }
-            for slot in 0..2 {
-                self.overlay.dismiss_audio(slot);
-                self.sound.stop(slot);
-            }
+            self.stop_audio_panels();
             if self.fullscreen.is_some() {
                 self.toggle_fullscreen(hwnd);
             }
             repaint(hwnd);
         }
+    }
+
+    fn stop_audio_panels(&mut self) {
+        for slot in 0..2 {
+            self.overlay.dismiss_audio(slot);
+            self.sound.stop(slot);
+        }
+        self.tempo_taps.clear();
     }
 
     fn receive(&mut self, hwnd: HWND) {
@@ -865,7 +900,7 @@ impl Reader {
                     self.present(hwnd, key, frame);
                     changed = true;
                 }
-                Response::Thumbnail(key, frame) => changed |= self.thumbnail(key, frame),
+                Response::Thumbnail(key, frame) => self.thumbnail(hwnd, key, frame),
                 Response::Rendered(key, frame) if self.queued.contains(&key) => {
                     self.queued.retain(|queued| *queued != key);
                     self.cache.insert(key, frame.clone());
@@ -882,6 +917,7 @@ impl Reader {
                     }
                 }
                 Response::OpenError(session, error) if session == self.session => {
+                    self.stop_audio_panels();
                     self.status.clear();
                     self.resume_page = None;
                     self.concert = false;
@@ -1007,6 +1043,9 @@ impl Reader {
             if !self.save_ink(hwnd) {
                 return;
             }
+            if !self.page_grid_open() {
+                self.cancel_thumbnails();
+            }
             self.selected = next;
             self.animate_next_turn = animated && !self.view_moving;
             self.page_animation = None;
@@ -1026,6 +1065,7 @@ impl Reader {
             .as_ref()
             .map(|(key, _)| (key.session, key.index));
         if previous != Some((key.session, key.index)) {
+            self.schedule_thumbnail_warmup(hwnd);
             self.ink.cancel_contact();
             if !self.save_ink(hwnd) {
                 return;
@@ -1058,13 +1098,15 @@ impl Reader {
             let path = self.store.as_ref().zip(score).map(|(store, score)| {
                 store.page_path(&score.source, score.pdf_page(key.index))
             });
-            if let Some((store, score)) = self.store.as_ref().zip(score) {
+            if let Some(score) = score {
                 let position = ReadingPosition {
                     path: score.source.path.clone(),
                     page: score.pdf_page(key.index),
                 };
-                if let Ok(recent) = store.record_reading(&position) {
-                    self.recent = recent;
+                if self.recent.first() != Some(&position) {
+                    position.move_to_front(&mut self.recent);
+                    self.reading_dirty = true;
+                    unsafe { SetTimer(Some(hwnd), READING_SAVE_TIMER, 750, None) };
                 }
             }
             self.recovered_page = false;
@@ -1086,6 +1128,16 @@ impl Reader {
         }
         self.visible = Some((key, frame));
         self.status.clear();
+    }
+
+    fn save_reading_position(&mut self, hwnd: HWND) {
+        let _ = unsafe { KillTimer(Some(hwnd), READING_SAVE_TIMER) };
+        if self.reading_dirty
+            && let Some(store) = &self.store
+            && store.save_recent(&self.recent).is_ok()
+        {
+            self.reading_dirty = false;
+        }
     }
 
     fn save_ink(&mut self, hwnd: HWND) -> bool {
@@ -1242,14 +1294,11 @@ impl Reader {
         }
     }
 
-    fn animate_frame(&mut self, hwnd: HWND) {
-        if let Some(clock) = &self.animation {
-            clock.read();
-        }
+    fn animate_frame(&mut self, hwnd: HWND) -> bool {
         let layout = Layout::new(hwnd, self.fullscreen.is_some());
         let (bounds, scale) = self.radial_area(&layout);
         let old = self.radial.footprint(bounds, scale);
-        let popup_before = self.overlay.popup_opacity;
+        let previous_cards = self.animated_card_bounds(&layout);
         let overlay = self.overlay.tick();
         if !self.overlay.popup_open && self.overlay.popup_opacity == 0.0 { self.chrome_visual = None; }
         let obstacles = self.radial_obstacles(&layout);
@@ -1269,7 +1318,10 @@ impl Reader {
             self.view_moving = true;
             repaint_rect(hwnd, layout.viewport);
         }
-        let returning = self.page_drag.as_ref().is_some_and(|drag| drag.released.is_some());
+        let dragging_page = self.page_drag.as_ref().is_some_and(|drag| {
+            drag.released.is_some()
+                || self.visible.as_ref().is_some_and(|(key, _)| key.index == self.selected)
+        });
         if let Some(drag) = &self.page_drag
             && let Some(start) = drag.released
         {
@@ -1293,16 +1345,29 @@ impl Reader {
             let next = self.radial.footprint(bounds, scale);
             repaint_rect(hwnd, union(old, next));
         }
-        if self.overlay.popup_opacity != popup_before {
-            repaint(hwnd);
-        } else if overlay {
-            repaint_rect(hwnd, layout.viewport);
+        if overlay {
+            let next_cards = self.animated_card_bounds(&layout);
+            for &(rect, opacity) in &previous_cards {
+                if !next_cards.contains(&(rect, opacity)) {
+                    repaint_rect(hwnd, rect);
+                }
+            }
+            for &(rect, opacity) in &next_cards {
+                if !previous_cards.contains(&(rect, opacity)) {
+                    repaint_rect(hwnd, rect);
+                }
+            }
         }
-        if !radial && !overlay && !zooming && !returning && turn_frame.is_none() {
+        if !radial && !overlay && !zooming && !self.view_moving && !dragging_page && turn_frame.is_none() {
             if let Some(clock) = &self.animation {
                 clock.stop();
             }
+            self.radial.reset_frame_time();
+            self.overlay.reset_frame_time();
             let _ = unsafe { KillTimer(Some(hwnd), RADIAL_TIMER) };
+            true
+        } else {
+            false
         }
     }
 
@@ -1316,8 +1381,10 @@ impl Reader {
             if self.view != previous {
                 self.page_animation = None;
                 self.view_moving = true;
+                self.view_panning = self.view.zoom() == previous.zoom();
                 self.defer_view_refresh(hwnd);
                 repaint_rect(hwnd, viewport);
+                self.animate(hwnd);
             }
         }
     }
@@ -1365,6 +1432,7 @@ impl Reader {
             next / self.view.zoom(),
         );
         self.page_animation = None;
+        self.view_panning = false;
         self.zoom_animation = Some(ZoomAnimation {
             from: self.view,
             target,
@@ -1695,6 +1763,7 @@ impl Reader {
         drag.dx = dx;
         drag.released = None;
         repaint_rect(hwnd, layout.viewport);
+        self.animate(hwnd);
     }
 
     fn release_page_drag(&mut self, hwnd: HWND) {
@@ -1852,7 +1921,9 @@ impl Reader {
         unsafe {
             let dc = BeginPaint(hwnd, &mut paint);
             if !dc.is_invalid() {
-                self.prepare_page_surface(dc, &layout);
+                if !self.page_grid_open() && intersect(layout.viewport, paint.rcPaint).is_some() {
+                    self.prepare_page_surface(dc, &layout);
+                }
                 if let Some(drag) = &mut self.page_drag
                     && let Some(index) = drag.neighbor
                     && let Some((_, frame)) = self.cache.iter().find(|(key, _)| key.index == index)
@@ -1868,6 +1939,10 @@ impl Reader {
                         self.page_animation = None;
                     }
                 }
+                if self.paint_direct2d(hwnd, dc, &layout, paint.rcPaint) {
+                    let _ = EndPaint(hwnd, &paint);
+                    return;
+                }
                 let (width, height) = (layout.client.right, layout.client.bottom);
                 if self
                     .paint_buffer
@@ -1877,16 +1952,7 @@ impl Reader {
                     self.paint_buffer = Surface::new(dc, width, height);
                 }
                 if let Some(surface) = &self.paint_buffer {
-                    // Compose the whole radial menu before copying the invalid area.
-                    let (bounds, scale) = self.radial_area(&layout);
-                    let radial = self.radial.footprint(bounds, scale);
-                    let damage = if (self.visible.is_some() || self.fullscreen.is_some())
-                        && intersect(paint.rcPaint, radial).is_some()
-                    {
-                        union(paint.rcPaint, radial)
-                    } else {
-                        paint.rcPaint
-                    };
+                    let damage = paint.rcPaint;
                     with_clip(surface.dc, damage, || {
                         self.draw(hwnd, surface.dc, &layout, damage)
                     });
@@ -1911,12 +1977,16 @@ impl Reader {
     }
 
     fn prepare_page_surface(&mut self, target: HDC, layout: &Layout) {
-        let Some((_, frame)) = &self.visible else {
+        let Some((key, frame)) = &self.visible else {
             self.page_surface = None;
             return;
         };
         let base = fit(frame, layout.viewport);
-        let (bounds, clip) = if self.view_moving {
+        let awaiting_detail = self.desired.is_some_and(|desired| {
+            key.index == desired.index && *key != desired && self.queued.contains(&desired)
+        });
+        let view_bounds = self.view.bounds(base, layout.viewport);
+        let (bounds, clip) = if self.view_moving || (awaiting_detail && self.view.zoom() > 1.0) {
             // Keep all source pixels and newly exposed edges available during the gesture.
             let full_page = RECT {
                 right: frame.width,
@@ -1925,7 +1995,7 @@ impl Reader {
             };
             (full_page, full_page)
         } else {
-            let bounds = self.view.bounds(base, layout.viewport);
+            let bounds = view_bounds;
             let Some(clip) = intersect(bounds, layout.viewport) else {
                 self.page_surface = None;
                 return;
@@ -1945,8 +2015,9 @@ impl Reader {
                 Some(page) => (Some(page.raster), page.composite),
                 None => (Surface::new(target, w, h), None),
             };
-            self.page_surface = raster.map(|raster| {
+            self.page_surface = raster.map(|mut raster| {
                 draw_bitmap(raster.dc, offset(bounds, -clip.left, -clip.top), frame);
+                raster.revision += 1;
                 PageSurface {
                     frame: frame.clone(),
                     bounds,
@@ -1954,18 +2025,22 @@ impl Reader {
                     raster,
                     composite,
                     ink_version: None,
+                    pan_raster: None,
                 }
             });
         }
         if let Some(page) = &mut self.page_surface {
             page.update_marks(target, &self.ink);
+            if self.direct2d.is_none() && self.view_moving && self.view_panning {
+                page.prepare_pan(target, view_bounds);
+            }
         }
     }
 
     fn draw(&self, hwnd: HWND, dc: HDC, layout: &Layout, damage: RECT) {
         fill(dc, damage, BACKGROUND);
         if self.page_grid_open() {
-            self.draw_page_grid(dc, layout);
+            self.draw_page_grid(dc, layout, damage);
         } else if let Some((_, frame)) = &self.visible {
             let bounds = self
                 .view
@@ -1992,6 +2067,10 @@ impl Reader {
         } else {
             self.draw_home(dc, layout, damage);
         }
+        self.draw_chrome(hwnd, dc, layout, damage);
+    }
+
+    fn draw_chrome(&self, hwnd: HWND, dc: HDC, layout: &Layout, damage: RECT) {
         if let Some(strip) = layout.strip
             && intersect(strip.rect, damage).is_some()
         {
@@ -2036,6 +2115,15 @@ impl Reader {
     fn radial_area(&self, layout: &Layout) -> (RECT, f32) {
         let area = layout.viewport;
         (area, self.radial.display_scale(area, layout.scale))
+    }
+
+    fn animated_card_bounds(&self, layout: &Layout) -> Vec<(RECT, f32)> {
+        let closing_popup = self.chrome_menu.is_none()
+            .then(|| self.chrome_visual.and_then(|menu| self.chrome_card_for(layout, menu)))
+            .flatten();
+        self.cards(layout).into_iter().chain(closing_popup)
+            .map(|card| (card.rect, card.opacity))
+            .collect()
     }
 
     fn radial_obstacles(&self, layout: &Layout) -> Vec<RECT> {
@@ -2162,6 +2250,7 @@ struct PageSurface {
     raster: Surface,
     composite: Option<Surface>,
     ink_version: Option<LayerVersion>,
+    pan_raster: Option<Surface>,
 }
 
 #[derive(Default)]
@@ -2216,7 +2305,7 @@ struct PageAnimation {
 impl PageAnimation {
     fn duration(&self) -> Duration {
         let width = (self.viewport.right - self.viewport.left).max(1);
-        Duration::from_millis((175 - 120 * i64::from(self.distance.min(width)) / i64::from(width)) as u64)
+        Duration::from_millis((235 - 145 * i64::from(self.distance.min(width)) / i64::from(width)) as u64)
     }
 
     fn prepare(&mut self, incoming: Option<&PageSurface>) -> bool {
@@ -2226,27 +2315,28 @@ impl PageAnimation {
     }
 
     fn draw(&self, dc: HDC, damage: RECT, incoming: Option<&PageSurface>) -> bool {
-        let Some(started) = self.started else {
-            return false;
-        };
-        let progress = started.elapsed().as_secs_f32() / self.duration().as_secs_f32();
-        if progress >= 1.0 {
-            return false;
-        }
+        let Some((travel, width, direction, edge, progress)) = self.position() else { return false };
         let Some(damage) = intersect(self.viewport, damage) else { return false };
+        let Some(incoming) = incoming else { return false };
+        Self::copy_shifted(dc, &self.outgoing, self.clip, damage, travel);
+        let source = incoming.composite.as_ref().unwrap_or(&incoming.raster);
+        Self::copy_shifted(dc, source, incoming.clip, damage, travel - width * direction);
+        with_clip(dc, damage, || self.draw_edge(dc, edge, direction, progress));
+        true
+    }
+
+    fn position(&self) -> Option<(i32, i32, i32, i32, f32)> {
+        let progress = self.started?.elapsed().as_secs_f32() / self.duration().as_secs_f32();
+        if progress >= 1.0 {
+            return None;
+        }
         let width = self.viewport.right - self.viewport.left;
         let eased = 1.0 - (1.0 - progress).powi(2);
         let start = self.distance.clamp(0, width);
         let distance = start + ((width - start) as f32 * eased).round() as i32;
         let direction = if self.forward { -1 } else { 1 };
         let edge = if self.forward { self.viewport.right - distance } else { self.viewport.left + distance };
-        let Some(incoming) = incoming else { return false };
-        fill(dc, damage, BACKGROUND);
-        Self::copy_shifted(dc, &self.outgoing, self.clip, damage, distance * direction);
-        let source = incoming.composite.as_ref().unwrap_or(&incoming.raster);
-        Self::copy_shifted(dc, source, incoming.clip, damage, (distance - width) * direction);
-        with_clip(dc, damage, || self.draw_edge(dc, edge, direction, progress));
-        true
+        Some((distance * direction, width, direction, edge, progress))
     }
 
     fn copy_shifted(dc: HDC, source: &Surface, bounds: RECT, damage: RECT, dx: i32) {
@@ -2276,6 +2366,7 @@ impl PageSurface {
         if self.ink_version == Some(version) {
             return;
         }
+        self.pan_raster = None;
         if version.count == 0 {
             self.composite = None;
             self.ink_version = Some(version);
@@ -2285,7 +2376,7 @@ impl PageSurface {
         if self.composite.is_none() {
             self.composite = Surface::new(target, w, h);
         }
-        if let Some(composite) = &self.composite {
+        if let Some(composite) = &mut self.composite {
             let local = RECT {
                 left: 0,
                 top: 0,
@@ -2304,11 +2395,19 @@ impl PageSurface {
                 local,
                 first.unwrap_or(0),
             );
+            composite.revision += 1;
             self.ink_version = Some(version);
         }
     }
 
     fn draw(&self, dc: HDC, bounds: RECT, clip: RECT) {
+        let (width, height) = (bounds.right - bounds.left, bounds.bottom - bounds.top);
+        if let Some(pan) = self.pan_raster.as_ref().filter(|surface| surface.fits(width, height)) {
+            if let Some(to) = intersect(bounds, clip) {
+                pan.copy_to(dc, to, to.left - bounds.left, to.top - bounds.top);
+            }
+            return;
+        }
         let source = self.composite.as_ref().unwrap_or(&self.raster);
         if self.bounds != bounds
             && self.bounds == self.clip
@@ -2323,6 +2422,26 @@ impl PageSurface {
             source.copy_to(dc, to, to.left - self.clip.left, to.top - self.clip.top);
         }
     }
+
+    fn prepare_pan(&mut self, target: HDC, bounds: RECT) {
+        let (width, height) = (bounds.right - bounds.left, bounds.bottom - bounds.top);
+        // Keep one scaled page for panning at a fixed zoom. Bound its memory
+        // independently of display size and the maximum zoom.
+        if i64::from(width) * i64::from(height) > 8_000_000 {
+            self.pan_raster = None;
+            return;
+        }
+        let source = self.composite.as_ref().unwrap_or(&self.raster);
+        if source.fits(width, height)
+            || self.pan_raster.as_ref().is_some_and(|surface| surface.fits(width, height))
+        {
+            return;
+        }
+        self.pan_raster = Surface::new(target, width, height);
+        if let Some(pan) = &self.pan_raster {
+            source.stretch_to(pan.dc, RECT { right: width, bottom: height, ..Default::default() });
+        }
+    }
 }
 
 pub(crate) struct Surface {
@@ -2331,6 +2450,8 @@ pub(crate) struct Surface {
     previous: HGDIOBJ,
     width: i32,
     height: i32,
+    id: u64,
+    revision: u64,
 }
 
 impl Surface {
@@ -2360,6 +2481,11 @@ impl Surface {
                 previous,
                 width,
                 height,
+                id: {
+                    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                    NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                },
+                revision: 0,
             })
         }
     }
@@ -2386,8 +2512,9 @@ impl Surface {
 
     fn stretch_to(&self, dc: HDC, to: RECT) {
         unsafe {
-            SetStretchBltMode(dc, HALFTONE);
-            let _ = SetBrushOrgEx(dc, 0, 0, None);
+            // Interactive scaling uses the cached surface. Once the view settles,
+            // prepare_page_surface rebuilds the visible region with HALFTONE.
+            SetStretchBltMode(dc, COLORONCOLOR);
             let _ = StretchBlt(
                 dc,
                 to.left,
@@ -2631,6 +2758,21 @@ pub(crate) fn text_left(dc: HDC, rect: RECT, label: &str, color: COLORREF, size:
     draw_text(dc, rect, label, color, size, false, DT_LEFT);
 }
 
+#[derive(Default)]
+struct TextFonts(HashMap<i32, HFONT>);
+
+impl Drop for TextFonts {
+    fn drop(&mut self) {
+        for font in self.0.values() {
+            let _ = unsafe { DeleteObject((*font).into()) };
+        }
+    }
+}
+
+thread_local! {
+    static TEXT_FONTS: RefCell<TextFonts> = RefCell::default();
+}
+
 fn draw_text(
     dc: HDC,
     mut rect: RECT,
@@ -2646,8 +2788,8 @@ fn draw_text(
     }
     let mut utf16: Vec<u16> = label.encode_utf16().collect();
     unsafe {
-        let make_font = |height: i32| {
-            CreateFontW(
+        let font_at = |height: i32| TEXT_FONTS.with(|fonts| {
+            *fonts.borrow_mut().0.entry(height).or_insert_with(|| CreateFontW(
                 -height,
                 0,
                 0,
@@ -2662,11 +2804,10 @@ fn draw_text(
                 CLEARTYPE_QUALITY,
                 DEFAULT_PITCH.0 as u32,
                 w!("Segoe UI"),
-            )
-        };
+            ))
+        });
         let mut font_size = size;
-        let mut font = make_font(font_size);
-        let prior = SelectObject(dc, font.into());
+        let prior = SelectObject(dc, font_at(font_size).into());
         if fit {
             let mut extent = SIZE::default();
             let width = (rect.right - rect.left - 3).max(1);
@@ -2675,10 +2816,7 @@ fn draw_text(
                 && extent.cx > width
             {
                 font_size = (font_size * width / extent.cx).clamp(1, font_size - 1);
-                let smaller = make_font(font_size);
-                SelectObject(dc, smaller.into());
-                let _ = DeleteObject(font.into());
-                font = smaller;
+                SelectObject(dc, font_at(font_size).into());
             }
         }
         SetTextColor(dc, color);
@@ -2698,7 +2836,6 @@ fn draw_text(
                 },
         );
         SelectObject(dc, prior);
-        let _ = DeleteObject(font.into());
     }
 }
 
@@ -2728,6 +2865,14 @@ pub(crate) fn rounded(dc: HDC, rect: RECT, color: COLORREF, round: i32) {
         SelectObject(dc, prior_brush);
         let _ = DeleteObject(brush.into());
     }
+}
+
+fn draw_scrollbar(dc: HDC, bar: overlay::Scrollbar, scale: f32) {
+    let width = (6.0 * scale).round().max(3.0) as i32;
+    let left = (bar.track.left + bar.track.right - width) / 2;
+    let track = RECT { left, right: left + width, ..bar.track };
+    rounded(dc, track, MENU_BORDER, width);
+    rounded(dc, RECT { top: bar.thumb.top, bottom: bar.thumb.bottom, ..track }, MUTED, width);
 }
 
 fn button(dc: HDC, rect: RECT, label: &str, primary: bool, scale: f32) {
@@ -2965,6 +3110,15 @@ mod tests {
             assert_eq!(preview.composite.as_ref().unwrap().bitmap, preview_bitmap);
         }
         reader.view_moving = false;
+        let detail = PageKey { width: key.width * 2, height: key.height * 2, ..key };
+        reader.desired = Some(detail);
+        reader.queued.push(detail);
+        reader.prepare_page_surface(dc, &layout);
+        assert_eq!(
+            reader.page_surface.as_ref().unwrap().composite.as_ref().unwrap().bitmap,
+            preview_bitmap
+        );
+        reader.queued.clear();
         reader.prepare_page_surface(dc, &layout);
         let settled = reader.page_surface.as_ref().unwrap();
         assert_eq!(settled.bounds, reader.view.bounds(viewport, viewport));

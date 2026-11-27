@@ -19,10 +19,18 @@ pub struct Store {
     root: PathBuf,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ReadingPosition {
     pub path: PathBuf,
     pub page: u32,
+}
+
+impl ReadingPosition {
+    pub fn move_to_front(self, recent: &mut Vec<Self>) {
+        recent.retain(|entry| entry.path != self.path);
+        recent.insert(0, self);
+        recent.truncate(50);
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -184,6 +192,10 @@ impl Store {
         Ok(settings)
     }
 
+    pub fn thumbnail_cache(&self) -> PathBuf {
+        self.root.join("thumbnails-v1")
+    }
+
     pub fn favorites(&self) -> io::Result<Favorites> {
         read_or_default(&self.root.join("tool-favorites.json"))
     }
@@ -198,15 +210,6 @@ impl Store {
 
     pub fn recent(&self) -> io::Result<Vec<ReadingPosition>> {
         read_or_default(&self.root.join("recent.json"))
-    }
-
-    pub fn record_reading(&self, position: &ReadingPosition) -> io::Result<Vec<ReadingPosition>> {
-        let mut recent = self.recent()?;
-        recent.retain(|entry| entry.path != position.path);
-        recent.insert(0, position.clone());
-        recent.truncate(50);
-        self.save_recent(&recent)?;
-        Ok(recent)
     }
 
     pub fn save_recent(&self, recent: &[ReadingPosition]) -> io::Result<()> {
@@ -339,6 +342,20 @@ impl ScoreFile {
             return Err(pdf_changed());
         }
         Ok(())
+    }
+
+    pub(crate) fn thumbnail_key(&self, page: u32, width: u32, height: u32) -> [u8; 32] {
+        let mut hash = Sha256::new();
+        hash.update(self.stamp.volume.to_le_bytes());
+        hash.update(self.stamp.id);
+        hash.update(self.stamp.revision.created.to_le_bytes());
+        hash.update(self.stamp.revision.written.to_le_bytes());
+        hash.update(self.stamp.revision.changed.to_le_bytes());
+        hash.update(self.stamp.revision.bytes.to_le_bytes());
+        hash.update(page.to_le_bytes());
+        hash.update(width.to_le_bytes());
+        hash.update(height.to_le_bytes());
+        hash.finalize().into()
     }
 }
 
@@ -732,16 +749,18 @@ mod tests {
     fn remembers_the_latest_physical_page_and_bounds_history() {
         let scratch = Scratch::new();
         let store = Store::at(scratch.0.join("state"));
+        let mut recent = Vec::new();
         for page in 0..51 {
-            store.record_reading(&ReadingPosition {
+            ReadingPosition {
                 path: PathBuf::from(format!("score-{page}.pdf")),
                 page,
-            }).unwrap();
+            }.move_to_front(&mut recent);
         }
-        store.record_reading(&ReadingPosition {
+        ReadingPosition {
             path: PathBuf::from("score-2.pdf"),
             page: 13,
-        }).unwrap();
+        }.move_to_front(&mut recent);
+        store.save_recent(&recent).unwrap();
         let recent = store.recent().unwrap();
         assert_eq!(recent.len(), 50);
         assert_eq!(recent[0].path, PathBuf::from("score-2.pdf"));

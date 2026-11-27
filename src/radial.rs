@@ -312,6 +312,10 @@ impl Radial {
         self.grabbed(id) && self.grab.take().is_some_and(|grab| grab.drag)
     }
 
+    pub fn reset_frame_time(&mut self) {
+        self.frame = None;
+    }
+
     pub fn tick(&mut self, viewport: RECT, input_scale: f32, obstacles: &[RECT]) -> bool {
         let now = Instant::now();
         let dt = self.frame.replace(now)

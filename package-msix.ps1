@@ -4,7 +4,7 @@ param(
     [string]$IdentityName = 'ScoreDraw.Development',
     [string]$Publisher = 'CN=ScoreDraw Development',
     [string]$PublisherDisplayName = 'ScoreDraw',
-    [version]$Version = '0.4.14.0',
+    [version]$Version = '0.4.15.0',
     [string]$OutputDirectory = (Join-Path $PSScriptRoot 'target\msix')
 )
 

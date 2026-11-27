@@ -388,13 +388,13 @@ impl Reader {
                     tr!("Metronomo", "Metronome"),
                     Glyph::Metronome,
                     E::Command(C::Metronome),
-                    true,
+                    self.visible.is_some(),
                 ),
                 (
                     tr!("Accordatore", "Tuner"),
                     Glyph::Gauge,
                     E::Command(C::Tuner),
-                    true,
+                    self.visible.is_some(),
                 ),
                 (
                     &tool,

@@ -64,6 +64,10 @@ impl<'a> Score<'a> {
         self.render_page(global_page - self.first_page, width, height)
     }
 
+    pub fn verify_revision(&self) -> std::io::Result<()> {
+        self.source.verify_revision(&self.file)
+    }
+
     pub fn render_page(&self, pdf_page: u32, width: u32, height: u32) -> PdfResult<Frame> {
         let page = self.document.pages().get(pdf_page.try_into()?)?;
         let page_width = page.width().value;
@@ -87,7 +91,7 @@ impl<'a> Score<'a> {
             )
             .into());
         }
-        self.source.verify_revision(&self.file)?;
+        self.verify_revision()?;
         Ok(Frame {
             width,
             height,

@@ -25,13 +25,13 @@ impl View {
         let (width, height) = (w * self.zoom(), h * self.zoom());
         let (offset_x, offset_y) = self.bounded_offset(base, viewport);
         let (cx, cy) = center(viewport);
-        let x = cx - width / 2.0 + offset_x;
-        let y = cy - height / 2.0 + offset_y;
+        let left = (cx - width / 2.0 + offset_x).round() as i32;
+        let top = (cy - height / 2.0 + offset_y).round() as i32;
         RECT {
-            left: x.round() as i32,
-            top: y.round() as i32,
-            right: (x + width).round() as i32,
-            bottom: (y + height).round() as i32,
+            left,
+            top,
+            right: left + width.round() as i32,
+            bottom: top + height.round() as i32,
         }
     }
 
@@ -356,6 +356,20 @@ mod tests {
         assert_eq!(view.bounds(page, page).left, 0);
         view.transform(page, page, (25.0, 25.0), (25.0, 25.0), 0.1);
         assert_eq!(view.bounds(page, page), page);
+    }
+
+    #[test]
+    fn fractional_pan_keeps_the_raster_size_at_a_fixed_zoom() {
+        let page = RECT { left: 0, top: 0, right: 503, bottom: 629 };
+        let center = (250.0, 300.0);
+        let mut view = View::default();
+        view.transform(page, page, center, center, 1.35);
+        let initial = dimensions(view.bounds(page, page));
+        for step in 1..40 {
+            let distance = step as f32 / 10.0;
+            view.transform(page, page, center, (center.0 + distance, center.1 - distance), 1.0);
+            assert_eq!(dimensions(view.bounds(page, page)), initial);
+        }
     }
 
     #[test]

@@ -2,10 +2,14 @@ use crate::data::{ScoreEntry, ScoreFile};
 use crate::pdf::{Frame, Score, open_engine, preview_dimensions};
 use pdfium_render::prelude::Pdfium;
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
+
+mod thumbnail_cache;
+use thumbnail_cache::ThumbnailCache;
 
 pub const RENDER_RESULT: u32 = WM_APP + 1;
 
@@ -77,7 +81,7 @@ pub enum Response {
     Unavailable(String),
 }
 
-pub fn spawn(hwnd: HWND) -> std::io::Result<(Sender<Request>, Receiver<Response>)> {
+pub fn spawn(hwnd: HWND, thumbnail_cache: PathBuf) -> std::io::Result<(Sender<Request>, Receiver<Response>)> {
     let (send_requests, receive_requests) = channel();
     let (send_results, receive_results) = channel();
     // HWND is used by the worker solely to post an asynchronous notification.
@@ -100,12 +104,12 @@ pub fn spawn(hwnd: HWND) -> std::io::Result<(Sender<Request>, Receiver<Response>
                     return;
                 }
             };
-            work(&engine, receive_requests, notify);
+            work(&engine, receive_requests, Some(ThumbnailCache::new(thumbnail_cache)), notify);
         })?;
     Ok((send_requests, receive_results))
 }
 
-fn work(engine: &Pdfium, inbox: Receiver<Request>, notify: impl Fn(Response)) {
+fn work(engine: &Pdfium, inbox: Receiver<Request>, cache: Option<ThumbnailCache>, notify: impl Fn(Response)) {
     let mut pending: VecDeque<(PageKey, bool)> = VecDeque::new();
     let mut thumbnails = VecDeque::new();
     let mut session = 0;
@@ -172,8 +176,18 @@ fn work(engine: &Pdfium, inbox: Receiver<Request>, notify: impl Fn(Response)) {
                 {
                     let pdf_page = key.index - score.first_page + pdf_start;
                     if thumbnail {
+                        let digest = score.source.thumbnail_key(pdf_page, key.width, key.height);
+                        if let Some(frame) = cache.as_ref().and_then(|cache| cache.read(digest, key))
+                            && score.verify_revision().is_ok()
+                        {
+                            notify(Response::Thumbnail(key, Some(Arc::new(frame))));
+                            continue;
+                        }
                         let frame = score.render_page(pdf_page, key.width, key.height).ok().map(Arc::new);
-                        notify(Response::Thumbnail(key, frame));
+                        notify(Response::Thumbnail(key, frame.clone()));
+                        if let (Some(cache), Some(frame)) = (&cache, frame) {
+                            cache.write(digest, &frame);
+                        }
                         continue;
                     }
                     if preview {
@@ -300,7 +314,7 @@ mod tests {
         let (outbox, responses) = channel();
         let worker = std::thread::spawn(move || {
             let engine = open_engine().unwrap();
-            work(&engine, inbox, |response| outbox.send(response).unwrap());
+            work(&engine, inbox, None, |response| outbox.send(response).unwrap());
         });
         requests
             .send(Request::Open(

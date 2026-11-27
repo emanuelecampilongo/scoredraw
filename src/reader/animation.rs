@@ -8,6 +8,38 @@ use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 pub const ANIMATION_FRAME: u32 = WM_APP + 11;
 const FRAME_PERIOD: Duration = Duration::from_micros(16_667);
 
+#[derive(Default)]
+pub(super) struct FrameTiming {
+    first: Option<Instant>,
+    last: Option<Instant>,
+    intervals: u32,
+    longest: Duration,
+}
+
+impl FrameTiming {
+    pub(super) fn painted(&mut self, now: Instant) {
+        self.first.get_or_insert(now);
+        if let Some(last) = self.last.replace(now) {
+            self.intervals += 1;
+            self.longest = self.longest.max(now - last);
+        }
+    }
+
+    pub(super) fn finish(&mut self) {
+        if let Some((first, last)) = self.first.zip(self.last)
+            && self.intervals > 1
+        {
+            let mean = (last - first).as_secs_f64() * 1000.0 / f64::from(self.intervals);
+            super::direct2d::trace(format_args!(
+                "Animation paint cadence: {} intervals, mean {mean:.2} ms, longest {:.2} ms",
+                self.intervals,
+                self.longest.as_secs_f64() * 1000.0,
+            ));
+        }
+        *self = Self::default();
+    }
+}
+
 pub struct Animation {
     wake: SyncSender<()>,
     active: Arc<AtomicBool>,
@@ -65,7 +97,8 @@ impl Animation {
         }
     }
 
-    pub fn read(&self) {
+    // Leave the frame outstanding until the window has actually painted it.
+    pub fn presented(&self) {
         self.pending.store(false, Ordering::Release);
     }
 

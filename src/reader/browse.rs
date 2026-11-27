@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::VecDeque;
 use windows::Win32::UI::Controls::{EM_LIMITTEXT, EM_SETCUEBANNER};
 
 pub(super) const SEARCH_ID: u16 = 271;
@@ -17,6 +18,7 @@ pub(super) struct Browser {
     hover: Option<POINT>,
     grab: Option<BrowseGrab>,
     previews: HashMap<PageKey, Option<Arc<Frame>>>,
+    preview_order: VecDeque<PageKey>,
     requested: Vec<PageKey>,
 }
 
@@ -29,6 +31,7 @@ struct BrowseGrab {
     origin: POINT,
     scroll: i32,
     moved: bool,
+    bar: Option<(overlay::Scrollbar, i32)>,
 }
 
 #[derive(Clone, Copy)]
@@ -103,14 +106,14 @@ impl Grid {
             top: v.top + px(if multi { 152 } else { 103 }), bottom: v.bottom - px(6),
         };
         let width = (list.right - list.left).max(1);
-        let cols = (width / px(172).max(1)).max(1) as usize;
+        let cols = (width / px(206).max(1)).max(1) as usize;
         let nav_width = ((width - px(10)) / 2).min(px(268));
         Self {
             close, search, list, cols,
             back: rect(list.left, v.top + px(93), nav_width, px(47)),
             next: rect(list.right - nav_width, v.top + px(93), nav_width, px(47)),
             cell_width: width / cols as i32,
-            cell_height: px(222).max(1),
+            cell_height: px(262).max(1),
         }
     }
 
@@ -120,6 +123,16 @@ impl Grid {
             self.list.top + (index / self.cols) as i32 * self.cell_height - scroll,
             self.cell_width, self.cell_height,
         )
+    }
+
+    fn card(self, index: usize, scroll: i32, layout: &Layout) -> RECT {
+        let cell = self.cell(index, scroll);
+        RECT {
+            left: cell.left + layout.px(5),
+            top: cell.top + layout.px(5),
+            right: cell.right - layout.px(5),
+            bottom: cell.bottom - layout.px(6),
+        }
     }
 
     fn visible(self, count: usize, scroll: i32) -> std::ops::Range<usize> {
@@ -137,14 +150,10 @@ fn max_scroll(bounds: RECT, height: i32) -> i32 {
     (height - (bounds.bottom - bounds.top)).max(0)
 }
 
-fn scroll_thumb(dc: HDC, bounds: RECT, height: i32, scroll: i32, scale: f32) {
-    let max = max_scroll(bounds, height);
-    if max == 0 { return; }
-    let height_visible = (bounds.bottom - bounds.top).max(1);
-    let size = (height_visible * height_visible / height).clamp(10.min(height_visible), height_visible);
-    let top = bounds.top + ((height_visible - size) as i64 * i64::from(scroll) / i64::from(max)) as i32;
-    let width = (3.0 * scale).round().max(2.0) as i32;
-    rounded(dc, rect(bounds.right + width, top, width, size), MUTED, width);
+fn scroll_bar(bounds: RECT, height: i32, scroll: i32, layout: &Layout) -> Option<overlay::Scrollbar> {
+    let left = bounds.right + layout.px(1);
+    let track = RECT { left, right: left + layout.px(12).max(4), ..bounds };
+    overlay::Scrollbar::new(track, max_scroll(bounds, height) as f32, scroll as f32, layout.px(24), 1.0)
 }
 
 impl Reader {
@@ -161,6 +170,7 @@ impl Reader {
     pub(super) fn page_grid_open(&self) -> bool { self.browse_mode() == Some(Mode::Pages) }
 
     pub(super) fn start_page_grid(&mut self, hwnd: HWND) {
+        let _ = unsafe { KillTimer(Some(hwnd), THUMBNAIL_WARMUP_TIMER) };
         self.browser.score = self.scores.iter().rposition(|score| score.first_page <= self.selected).unwrap_or(0);
         self.browser.page_query.clear();
         self.browser.page_scroll = 0;
@@ -176,10 +186,20 @@ impl Reader {
     }
 
     pub(super) fn leave_page_grid(&mut self) {
-        self.browser.requested.clear();
-        self.browser.previews.clear();
         self.browser.grab = None;
-        if let Some(worker) = &self.requests { let _ = worker.send(Request::Thumbnails(Vec::new())); }
+        self.cancel_thumbnails();
+    }
+
+    pub(super) fn cancel_thumbnails(&mut self) {
+        if !self.browser.requested.is_empty() {
+            self.request_thumbnails(Vec::new());
+        }
+    }
+
+    pub(super) fn reset_thumbnails(&mut self) {
+        self.leave_page_grid();
+        self.browser.previews.clear();
+        self.browser.preview_order.clear();
     }
 
     fn search_text(&self, mode: Mode) -> &str {
@@ -349,7 +369,29 @@ impl Reader {
     }
 
     fn grid_key(&self, index: u32) -> PageKey {
-        PageKey { session: self.session, index, width: 236, height: 294 }
+        PageKey { session: self.session, index, width: 300, height: 380 }
+    }
+
+    pub(super) fn schedule_thumbnail_warmup(&self, hwnd: HWND) {
+        unsafe { SetTimer(Some(hwnd), THUMBNAIL_WARMUP_TIMER, 650, None) };
+    }
+
+    pub(super) fn warm_thumbnails(&mut self, hwnd: HWND) {
+        let _ = unsafe { KillTimer(Some(hwnd), THUMBNAIL_WARMUP_TIMER) };
+        if self.page_grid_open() || self.editable_frame().is_none() { return; }
+        if self.view_moving || self.ink.is_drawing() || self.page_animation.is_some()
+            || self.page_drag.is_some() || self.desired.is_some_and(|key| self.queued.contains(&key))
+        {
+            self.schedule_thumbnail_warmup(hwnd);
+            return;
+        }
+        let Some(score) = self.current_score() else { return };
+        let layout = Layout::new(hwnd, self.fullscreen.is_some());
+        let columns = Grid::new(&layout, self.scores.len() > 1).cols as u32;
+        let row = (self.selected - score.first_page) / columns * columns + score.first_page;
+        let end = (row + (columns * 2).min(24)).min(score.first_page + score.count);
+        let pages = std::iter::once(self.selected).chain((row..end).filter(|&page| page != self.selected));
+        self.request_thumbnails(pages.map(|index| self.grid_key(index)).collect());
     }
 
     pub(super) fn update_thumbnails(&mut self, _hwnd: HWND, layout: &Layout) {
@@ -358,9 +400,21 @@ impl Reader {
         let (first, count) = self.grid_pages().unwrap_or_default();
         let scroll = self.grid_scroll(grid, count);
         self.browser.page_scroll = scroll;
-        let visible: Vec<_> = grid.visible(count, scroll).map(|index| self.grid_key(first + index as u32)).collect();
-        self.browser.previews.retain(|key, _| visible.contains(key));
-        let missing: Vec<_> = visible.into_iter().filter(|key| !self.browser.previews.contains_key(key)).collect();
+        let visible = grid.visible(count, scroll);
+        let ahead = visible.end..(visible.end + grid.cols).min(count);
+        let behind = visible.start.saturating_sub(grid.cols)..visible.start;
+        let selected = self.selected.checked_sub(first).map(|index| index as usize)
+            .filter(|index| visible.contains(index));
+        let pages = selected.into_iter()
+            .chain(visible.filter(|index| Some(*index) != selected))
+            .chain(ahead).chain(behind)
+            .map(|index| self.grid_key(first + index as u32))
+            .collect();
+        self.request_thumbnails(pages);
+    }
+
+    fn request_thumbnails(&mut self, mut missing: Vec<PageKey>) {
+        missing.retain(|key| !self.browser.previews.contains_key(key));
         if missing != self.browser.requested {
             self.browser.requested = missing;
             if let Some(worker) = &self.requests {
@@ -369,11 +423,27 @@ impl Reader {
         }
     }
 
-    pub(super) fn thumbnail(&mut self, key: PageKey, frame: Option<Arc<Frame>>) -> bool {
-        if !self.page_grid_open() || !self.browser.requested.contains(&key) { return false; }
+    pub(super) fn thumbnail(&mut self, hwnd: HWND, key: PageKey, frame: Option<Arc<Frame>>) {
+        if key.session != self.session || !self.browser.requested.contains(&key) { return; }
         self.browser.requested.retain(|requested| *requested != key);
+        self.browser.preview_order.push_back(key);
         self.browser.previews.insert(key, frame);
-        true
+        if self.browser.preview_order.len() > 96
+            && let Some(oldest) = self.browser.preview_order.pop_front()
+        {
+            self.browser.previews.remove(&oldest);
+        }
+        if self.page_grid_open()
+            && let Some((first, count)) = self.grid_pages()
+            && let Some(index) = key.index.checked_sub(first).map(|index| index as usize)
+        {
+            let layout = Layout::new(hwnd, self.fullscreen.is_some());
+            let grid = Grid::new(&layout, self.scores.len() > 1);
+            let scroll = self.grid_scroll(grid, count);
+            if index < count && let Some(damage) = intersect(grid.cell(index, scroll), grid.list) {
+                repaint_rect(hwnd, damage);
+            }
+        }
     }
 
     fn grid_click(&mut self, hwnd: HWND, grid: Grid, point: POINT, layout: &Layout) {
@@ -433,29 +503,38 @@ impl Reader {
         let home = Home::new(&layout);
         let grid = Grid::new(&layout, self.scores.len() > 1);
         if self.browser.grab.is_some_and(|grab| grab.id != id) { return inside(layout.viewport, point); }
+        let count = self.grid_pages().map_or(0, |(_, count)| count);
         match msg {
             WM_POINTERDOWN if inside(layout.viewport, point) => {
                 // A title-bar menu or floating panel gets first chance at a press.
-                let scroll = match mode {
-                    Mode::Home => self.home_scroll(home),
-                    Mode::Pages => self.grid_scroll(grid, self.grid_pages().map_or(0, |(_, count)| count)),
+                let (list, height, scroll) = match mode {
+                    Mode::Home => (home.list, self.recent_indices().len() as i32 * home.row, self.home_scroll(home)),
+                    Mode::Pages => (
+                        grid.list,
+                        (count.div_ceil(grid.cols) as i32).saturating_mul(grid.cell_height),
+                        self.grid_scroll(grid, count),
+                    ),
                 };
-                self.browser.grab = Some(BrowseGrab { id, origin: point, scroll, moved: false });
+                let bar = scroll_bar(list, height, scroll, &layout)
+                    .filter(|bar| inside(bar.track, point))
+                    .map(|bar| (bar, bar.grab(point.y)));
+                self.browser.grab = Some(BrowseGrab { id, origin: point, scroll, moved: bar.is_some(), bar });
+                if let Some((bar, offset)) = bar
+                    && !(bar.thumb.top..bar.thumb.bottom).contains(&point.y)
+                {
+                    self.scroll_browse(hwnd, mode, &layout, bar.scroll(point.y, offset).round() as i32);
+                }
             }
             WM_POINTERUPDATE => {
                 let Some(grab) = &mut self.browser.grab else { return false };
                 let list = if mode == Mode::Home { home.list } else { grid.list };
                 let dy = point.y - grab.origin.y;
-                if inside(list, grab.origin) && (grab.moved || dy.abs() > layout.px(5)) {
+                if let Some((bar, offset)) = grab.bar {
+                    self.scroll_browse(hwnd, mode, &layout, bar.scroll(point.y, offset).round() as i32);
+                } else if inside(list, grab.origin) && (grab.moved || dy.abs() > layout.px(5)) {
                     grab.moved = true;
                     let scroll = grab.scroll.saturating_sub(dy);
-                    if mode == Mode::Home {
-                        self.browser.home_scroll = scroll;
-                    } else {
-                        self.browser.page_scroll = scroll;
-                        self.update_thumbnails(hwnd, &layout);
-                    }
-                    repaint(hwnd);
+                    self.scroll_browse(hwnd, mode, &layout, scroll);
                 }
             }
             WM_POINTERUP => {
@@ -472,11 +551,42 @@ impl Reader {
         true
     }
 
+    fn scroll_browse(&mut self, hwnd: HWND, mode: Mode, layout: &Layout, scroll: i32) {
+        if mode == Mode::Home {
+            self.browser.home_scroll = scroll;
+            self.browser.home_scroll = self.home_scroll(Home::new(layout));
+        } else {
+            self.browser.page_scroll = scroll;
+            self.update_thumbnails(hwnd, layout);
+        }
+        repaint_rect(hwnd, layout.viewport);
+    }
+
     pub(super) fn browse_hover(&mut self, hwnd: HWND, point: Option<POINT>) {
         if self.browse_mode().is_some() && self.browser.hover != point {
-            self.browser.hover = point;
+            let previous = std::mem::replace(&mut self.browser.hover, point);
             let layout = Layout::new(hwnd, self.fullscreen.is_some());
-            repaint_rect(hwnd, if self.page_grid_open() { layout.viewport } else { Home::new(&layout).list });
+            if self.page_grid_open() {
+                let grid = Grid::new(&layout, self.scores.len() > 1);
+                let count = self.grid_pages().map_or(0, |(_, count)| count);
+                let scroll = self.grid_scroll(grid, count);
+                let hit = |point: POINT| {
+                    [grid.back, grid.next].into_iter()
+                        .filter(|_| self.scores.len() > 1)
+                        .chain(grid.visible(count, scroll)
+                            .filter_map(|index| intersect(grid.card(index, scroll, &layout), grid.list)))
+                        .find(|rect| inside(*rect, point))
+                };
+                let old = previous.and_then(hit);
+                let new = point.and_then(hit);
+                if old != new {
+                    for rect in old.into_iter().chain(new) {
+                        repaint_rect(hwnd, rect);
+                    }
+                }
+            } else {
+                repaint_rect(hwnd, Home::new(&layout).list);
+            }
         }
     }
 
@@ -532,39 +642,43 @@ impl Reader {
                 fill(dc, RECT { top: bounds.bottom, bottom: bounds.bottom + 1, ..body }, SURFACE);
             }
         });
-        scroll_thumb(dc, home.list, hits.len() as i32 * home.row, scroll, layout.scale);
+        if let Some(bar) = scroll_bar(home.list, hits.len() as i32 * home.row, scroll, layout) {
+            draw_scrollbar(dc, bar, layout.scale);
+        }
     }
 
-    pub(super) fn draw_page_grid(&self, dc: HDC, layout: &Layout) {
+    pub(super) fn draw_page_grid(&self, dc: HDC, layout: &Layout, damage: RECT) {
         let grid = Grid::new(layout, self.scores.len() > 1);
         let v = layout.viewport;
         let px = |value| layout.px(value);
-        text_left(dc, RECT { left: v.left + px(15), right: grid.search.left - px(5), top: v.top + px(6), bottom: v.top + px(54) },
-            tr!("Vai a pagina", "Go to page"), TEXT, px(23));
-        rounded(dc, grid.search, SURFACE, px(14));
-        icon_button(dc, grid.close, Glyph::X, true, layout.scale);
         let Some(score) = self.scores.get(self.browser.score) else { return };
-        text(dc, RECT { top: v.top + px(56), bottom: v.top + px(89), ..grid.list },
-            &score.title, MUTED, px(15));
-        fill(dc, RECT { top: grid.list.top - px(5), bottom: grid.list.top - px(4), ..grid.list }, SURFACE);
-        if self.scores.len() > 1 {
-            let previous = self.browser.score.checked_sub(1).and_then(|index| self.scores.get(index));
-            let next = self.scores.get(self.browser.score + 1);
-            for (bounds, glyph, label, neighbor) in [
-                (grid.back, Glyph::ChevronLeft, tr!("Spartito precedente", "Previous score"), previous),
-                (grid.next, Glyph::ChevronRight, tr!("Spartito successivo", "Next score"), next),
-            ] {
-                let enabled = neighbor.is_some();
-                let hot = enabled && self.browser.hover.is_some_and(|point| inside(bounds, point));
-                rounded(dc, bounds, if hot { blend_color(SURFACE, ACCENT, 15) } else if enabled { SURFACE } else { PANEL }, px(15));
-                let glyph_bounds = RECT { right: bounds.left + px(35), ..bounds };
-                icons::draw(dc, glyph, glyph_bounds, px(19) as f32, if enabled { ACCENT } else { MUTED });
-                let side = RECT { left: glyph_bounds.right, right: bounds.right - px(8), ..bounds };
-                let label_bounds = if enabled { RECT { bottom: bounds.top + px(26), ..side } } else { side };
-                text_left(dc, label_bounds, label, if enabled { TEXT } else { MUTED }, px(14));
-                if let Some(neighbor) = neighbor {
-                    text_left(dc, RECT { top: bounds.top + px(24), bottom: bounds.bottom - px(2), ..side },
-                        &neighbor.title, MUTED, px(12));
+        if damage.top < grid.list.top {
+            text_left(dc, RECT { left: v.left + px(15), right: grid.search.left - px(5), top: v.top + px(6), bottom: v.top + px(54) },
+                tr!("Vai a pagina", "Go to page"), TEXT, px(23));
+            rounded(dc, grid.search, SURFACE, px(14));
+            icon_button(dc, grid.close, Glyph::X, true, layout.scale);
+            text(dc, RECT { top: v.top + px(56), bottom: v.top + px(89), ..grid.list },
+                &score.title, MUTED, px(15));
+            fill(dc, RECT { top: grid.list.top - px(5), bottom: grid.list.top - px(4), ..grid.list }, SURFACE);
+            if self.scores.len() > 1 {
+                let previous = self.browser.score.checked_sub(1).and_then(|index| self.scores.get(index));
+                let next = self.scores.get(self.browser.score + 1);
+                for (bounds, glyph, label, neighbor) in [
+                    (grid.back, Glyph::ChevronLeft, tr!("Spartito precedente", "Previous score"), previous),
+                    (grid.next, Glyph::ChevronRight, tr!("Spartito successivo", "Next score"), next),
+                ] {
+                    let enabled = neighbor.is_some();
+                    let hot = enabled && self.browser.hover.is_some_and(|point| inside(bounds, point));
+                    rounded(dc, bounds, if hot { blend_color(SURFACE, ACCENT, 15) } else if enabled { SURFACE } else { PANEL }, px(15));
+                    let glyph_bounds = RECT { right: bounds.left + px(35), ..bounds };
+                    icons::draw(dc, glyph, glyph_bounds, px(19) as f32, if enabled { ACCENT } else { MUTED });
+                    let side = RECT { left: glyph_bounds.right, right: bounds.right - px(8), ..bounds };
+                    let label_bounds = if enabled { RECT { bottom: bounds.top + px(26), ..side } } else { side };
+                    text_left(dc, label_bounds, label, if enabled { TEXT } else { MUTED }, px(14));
+                    if let Some(neighbor) = neighbor {
+                        text_left(dc, RECT { top: bounds.top + px(24), bottom: bounds.bottom - px(2), ..side },
+                            &neighbor.title, MUTED, px(12));
+                    }
                 }
             }
         }
@@ -577,8 +691,8 @@ impl Reader {
             for index in grid.visible(count, scroll) {
                 let global = first + index as u32;
                 let cell = grid.cell(index, scroll);
-                let card = RECT { left: cell.left + px(5), right: cell.right - px(5),
-                    top: cell.top + px(5), bottom: cell.bottom - px(6) };
+                if intersect(cell, damage).is_none() { continue; }
+                let card = grid.card(index, scroll, layout);
                 let selected = self.selected == global;
                 let hovered = self.browser.hover.is_some_and(|point| inside(card, point));
                 rounded(dc, card, if selected { ACCENT } else if hovered { SURFACE } else { PANEL }, px(15));
@@ -593,7 +707,9 @@ impl Reader {
                     if selected { BACKGROUND } else { TEXT }, px(15));
             }
         });
-        scroll_thumb(dc, grid.list, (count.div_ceil(grid.cols) as i32).saturating_mul(grid.cell_height), scroll, layout.scale);
+        if let Some(bar) = scroll_bar(grid.list, (count.div_ceil(grid.cols) as i32).saturating_mul(grid.cell_height), scroll, layout) {
+            draw_scrollbar(dc, bar, layout.scale);
+        }
     }
 }
 
@@ -631,6 +747,18 @@ mod tests {
         assert_eq!(reader.recent_indices(), [0, 2]);
         reader.browser.home_query = "assente".into();
         assert!(reader.recent_indices().is_empty());
+    }
+
+    #[test]
+    fn scrollbar_drag_reaches_both_ends_and_keeps_the_grab_offset() {
+        let track = rect(0, 20, 12, 200);
+        let bar = overlay::Scrollbar::new(track, 900.0, 450.0, 24, 1.0).unwrap();
+        let y = bar.thumb.top + 8;
+        let grab = bar.grab(y);
+        assert_eq!(grab, 8);
+        assert!((bar.scroll(y, grab) - 450.0).abs() < 3.0);
+        assert_eq!(bar.scroll(track.top - 10, grab), 0.0);
+        assert_eq!(bar.scroll(track.bottom + 10, grab), 900.0);
     }
 
     #[test]
